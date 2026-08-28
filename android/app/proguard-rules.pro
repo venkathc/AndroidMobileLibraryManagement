@@ -1,0 +1,1 @@
+# No release-specific rules are required while code shrinking is disabled.

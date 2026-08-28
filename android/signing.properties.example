@@ -1,0 +1,6 @@
+# Copy this file to signing.properties, then replace every placeholder locally.
+# Never commit signing.properties or the keystore file.
+storeFile=personal-library-release.jks
+storePassword=REPLACE_WITH_KEYSTORE_PASSWORD
+keyAlias=personal-library
+keyPassword=REPLACE_WITH_KEY_PASSWORD
