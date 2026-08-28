@@ -6,7 +6,8 @@ import streamlit as st
 
 from config import APP_NAME
 from database import SessionLocal, initialise_database
-from pages import add_book, catalog, dashboard, delete_book, edit_book, loans, reports, search_books, settings, view_books, wishlist
+from pages import about, add_book, catalog, dashboard, delete_book, edit_book, loans, reports, search_books, settings, users, view_books, wishlist
+from services.auth_service import AuthService
 
 st.set_page_config(page_title=APP_NAME, page_icon="books", layout="wide")
 initialise_database()
@@ -23,13 +24,70 @@ PAGES = {
     "Wishlist": wishlist,
     "Borrowed/Lent Books": loans,
     "Settings and Backup": settings,
+    "About this app": about,
 }
 
 
 def main() -> None:
     """Run the selected Phase 1 screen with a scoped database session."""
+    st.session_state.setdefault("authenticated_user", None)
+    st.session_state.setdefault("switch_back_user", None)
+    with SessionLocal() as session:
+        auth_service = AuthService(session)
+        auth_service.ensure_admin()
+        if st.session_state.authenticated_user is None:
+            _, sign_in_column, _ = st.columns((2, 3, 2))
+            with sign_in_column:
+                st.title("Sign in")
+                with st.form("sign_in"):
+                    usernames = [user.username for user in auth_service.list_users()]
+                    username = st.selectbox(
+                        "Username",
+                        [""] + usernames,
+                        format_func=lambda value: "Select a user" if not value else value,
+                    )
+                    password = st.text_input("Password", type="password")
+                    sign_in_submitted = st.form_submit_button("Sign in", type="primary", width="stretch")
+                    cancel_submitted = st.form_submit_button("Cancel switch", width="stretch") if st.session_state.switch_back_user else False
+                if cancel_submitted:
+                    st.session_state.authenticated_user = st.session_state.switch_back_user
+                    st.session_state.switch_back_user = None
+                    st.rerun()
+                if sign_in_submitted:
+                    user = auth_service.authenticate(username, password)
+                    if user is None:
+                        st.error("Incorrect username or password.")
+                    else:
+                        st.session_state.authenticated_user = {"username": user.username, "role": user.role}
+                        st.session_state.switch_back_user = None
+                        st.rerun()
+            return
+
     st.sidebar.title(APP_NAME)
-    selected_page = st.sidebar.radio("Navigation", list(PAGES), key="navigation")
+    authenticated_user = st.session_state.authenticated_user
+    if "role" not in authenticated_user:
+        authenticated_user["role"] = "Administrator" if authenticated_user.get("is_admin") else "User"
+    pages = dict(PAGES)
+    if authenticated_user["role"] == "Guest":
+        pages = {
+            name: page for name, page in pages.items()
+            if name in {"Dashboard", "View Books", "Search Books", "Reports", "About this app"}
+        }
+    elif authenticated_user["role"] == "User":
+        pages.pop("Delete Book")
+    else:
+        pages["User management"] = users
+    st.sidebar.caption(f"Signed in as {authenticated_user['username']}")
+    switch_user_column, sign_out_column = st.sidebar.columns(2)
+    if switch_user_column.button("Switch user"):
+        st.session_state.switch_back_user = authenticated_user
+        st.session_state.authenticated_user = None
+        st.rerun()
+    if sign_out_column.button("Sign out"):
+        st.session_state.authenticated_user = None
+        st.session_state.switch_back_user = None
+        st.rerun()
+    selected_page = st.sidebar.radio("Navigation", list(pages), key="navigation")
     st.html(
         """
         <style>
@@ -165,7 +223,7 @@ def main() -> None:
         """
     )
     with SessionLocal() as session:
-        PAGES[selected_page].render(session)
+        pages[selected_page].render(session)
 
 
 if __name__ == "__main__":

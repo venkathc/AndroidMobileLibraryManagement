@@ -36,6 +36,11 @@ def _apply_sqlite_migrations() -> None:
     if "cover_image_path" not in columns:
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE books ADD COLUMN cover_image_path VARCHAR(255)"))
+    user_columns = {column["name"] for column in inspect(engine).get_columns("users")}
+    if "role" not in user_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'User'"))
+            connection.execute(text("UPDATE users SET role = 'Administrator' WHERE is_admin = 1"))
 
 
 def get_session() -> Generator[Session, None, None]:
