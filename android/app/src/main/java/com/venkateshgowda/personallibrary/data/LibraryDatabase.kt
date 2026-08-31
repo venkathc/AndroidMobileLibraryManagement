@@ -29,6 +29,7 @@ data class BookEntity(
     val pricePaise: Long = 0,
     val category: String? = null,
     val isbn: String? = null,
+    val barcode: String? = null,
     val coverImagePath: String? = null,
     val readingStatus: String = "Unread",
     val favourite: Boolean = false,
@@ -56,8 +57,80 @@ data class LibraryEntity(
 data class UserEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val username: String,
+    val displayName: String? = null,
+    val email: String? = null,
+    val avatarPath: String? = null,
     val passwordHash: String,
     val isAdmin: Boolean = false,
+    val role: String = UserRole.Member.name,
+    val accountStatus: String = "Active",
+    val forcePasswordReset: Boolean = false,
+    val lastLoginAtMillis: Long? = null,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+
+enum class UserRole(val label: String, val permissions: Set<LibraryPermission>) {
+    Owner("Owner", LibraryPermission.values().toSet()),
+    Admin("Admin", setOf(LibraryPermission.ViewBooks, LibraryPermission.SearchBooks, LibraryPermission.AddBooks, LibraryPermission.EditBooks, LibraryPermission.DeleteBooks, LibraryPermission.ManageCategories, LibraryPermission.ManageTags, LibraryPermission.ManageUsers, LibraryPermission.ApproveRequests, LibraryPermission.ViewReports)),
+    Librarian("Librarian", setOf(LibraryPermission.ViewBooks, LibraryPermission.SearchBooks, LibraryPermission.AddBooks, LibraryPermission.EditBooks, LibraryPermission.ManageLoans, LibraryPermission.ViewReports)),
+    Member("Member", setOf(LibraryPermission.ViewBooks, LibraryPermission.SearchBooks, LibraryPermission.AddPersonalNotes, LibraryPermission.AddRatings, LibraryPermission.ManageWishlist, LibraryPermission.BorrowBooks)),
+    Guest("Guest", setOf(LibraryPermission.ViewBooks, LibraryPermission.SearchBooks));
+
+    companion object {
+        fun fromStored(value: String, isAdmin: Boolean) = when (value) {
+            "Administrator" -> Owner
+            "User" -> Member
+            else -> values().firstOrNull { it.name == value } ?: if (isAdmin) Owner else Member
+        }
+    }
+}
+
+val UserEntity.userRole: UserRole
+    get() = UserRole.fromStored(role, isAdmin)
+
+enum class LibraryPermission {
+    ViewBooks, SearchBooks, AddBooks, EditBooks, DeleteBooks, ManageCategories, ManageTags,
+    ManageLoans, BorrowBooks, ManageWishlist, AddPersonalNotes, AddRatings, ManageUsers,
+    ApproveRequests, ManageLibrarySettings, ImportExport, DeleteLibrary, TransferOwnership,
+    ViewReports
+}
+
+fun UserRole.can(permission: LibraryPermission) = permission in permissions
+
+@Entity(tableName = "roles")
+data class RoleEntity(@PrimaryKey val id: String, val displayName: String, val isSystemRole: Boolean = true)
+
+@Entity(tableName = "permissions")
+data class PermissionEntity(@PrimaryKey val id: String, val displayName: String)
+
+@Entity(tableName = "library_memberships", indices = [Index(value = ["libraryId"]), Index(value = ["userId"]), Index(value = ["libraryId", "userId"], unique = true)])
+data class LibraryMembershipEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val libraryId: Long,
+    val userId: Long,
+    val role: String,
+    val status: String = "Active",
+    val joinedAtMillis: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "membership_requests", indices = [Index(value = ["libraryId"]), Index(value = ["email"])])
+data class MembershipRequestEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val libraryId: Long,
+    val email: String,
+    val inviteCode: String,
+    val status: String = "Pending",
+    val requestedAtMillis: Long = System.currentTimeMillis(),
+    val respondedAtMillis: Long? = null
+)
+
+@Entity(tableName = "audit_logs", indices = [Index(value = ["libraryId"]), Index(value = ["createdAtMillis"])])
+data class AuditLogEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val libraryId: Long,
+    val actorUserId: Long,
+    val action: String,
+    val detail: String,
     val createdAtMillis: Long = System.currentTimeMillis()
 )
 
@@ -141,6 +214,12 @@ data class TagEntity(@PrimaryKey(autoGenerate = true) val id: Long = 0, val name
 
 @Entity(tableName = "collections", indices = [Index(value = ["name"], unique = true)])
 data class CollectionEntity(@PrimaryKey(autoGenerate = true) val id: Long = 0, val name: String, val description: String? = null)
+
+@Entity(tableName = "library_categories", indices = [Index(value = ["libraryId", "name"], unique = true)])
+data class LibraryCategoryEntity(@PrimaryKey(autoGenerate = true) val id: Long = 0, val libraryId: Long, val name: String)
+
+@Entity(tableName = "library_languages", indices = [Index(value = ["libraryId", "name"], unique = true)])
+data class LibraryLanguageEntity(@PrimaryKey(autoGenerate = true) val id: Long = 0, val libraryId: Long, val name: String)
 
 @Entity(tableName = "book_tags", primaryKeys = ["bookId", "tagId"])
 data class BookTagEntity(val bookId: Long, val tagId: Long)
@@ -246,6 +325,9 @@ interface UserDao {
     @Query("SELECT * FROM users WHERE username = :username COLLATE NOCASE LIMIT 1")
     suspend fun findByUsername(username: String): UserEntity?
 
+    @Query("SELECT * FROM users WHERE id = :userId LIMIT 1")
+    suspend fun findById(userId: Long): UserEntity?
+
     @Query("SELECT COUNT(*) FROM users")
     suspend fun count(): Int
 
@@ -254,6 +336,18 @@ interface UserDao {
 
     @Update
     suspend fun update(user: UserEntity)
+
+    @Query("DELETE FROM library_memberships WHERE userId = :userId")
+    suspend fun deleteMembershipsForUser(userId: Long)
+
+    @Query("DELETE FROM users WHERE id = :userId")
+    suspend fun deleteUserRecord(userId: Long)
+
+    @Transaction
+    suspend fun deleteUser(userId: Long) {
+        deleteMembershipsForUser(userId)
+        deleteUserRecord(userId)
+    }
 
     @Query("SELECT * FROM users ORDER BY username COLLATE NOCASE")
     fun observeAll(): Flow<List<UserEntity>>
@@ -264,8 +358,85 @@ interface LibraryDao {
     @Insert
     suspend fun insert(library: LibraryEntity): Long
 
+    @Update
+    suspend fun update(library: LibraryEntity)
+
+    @Query("DELETE FROM book_tags WHERE bookId IN (SELECT id FROM books WHERE libraryId = :libraryId)")
+    suspend fun deleteBookTagsForLibrary(libraryId: Long)
+
+    @Query("DELETE FROM book_collections WHERE bookId IN (SELECT id FROM books WHERE libraryId = :libraryId)")
+    suspend fun deleteBookCollectionsForLibrary(libraryId: Long)
+
+    @Query("DELETE FROM books WHERE libraryId = :libraryId")
+    suspend fun deleteBooksForLibrary(libraryId: Long)
+
+    @Query("DELETE FROM wishlist WHERE libraryId = :libraryId")
+    suspend fun deleteWishlistForLibrary(libraryId: Long)
+
+    @Query("DELETE FROM library_categories WHERE libraryId = :libraryId")
+    suspend fun deleteCategoriesForLibrary(libraryId: Long)
+
+    @Query("DELETE FROM library_languages WHERE libraryId = :libraryId")
+    suspend fun deleteLanguagesForLibrary(libraryId: Long)
+
+    @Query("DELETE FROM libraries WHERE id = :libraryId")
+    suspend fun deleteLibraryRecord(libraryId: Long)
+
+    @Transaction
+    suspend fun deleteLibrary(libraryId: Long) {
+        deleteBookTagsForLibrary(libraryId)
+        deleteBookCollectionsForLibrary(libraryId)
+        deleteBooksForLibrary(libraryId)
+        deleteWishlistForLibrary(libraryId)
+        deleteCategoriesForLibrary(libraryId)
+        deleteLanguagesForLibrary(libraryId)
+        deleteLibraryRecord(libraryId)
+    }
+
     @Query("SELECT * FROM libraries ORDER BY createdAtMillis DESC, name COLLATE NOCASE")
     fun observeAll(): Flow<List<LibraryEntity>>
+}
+
+@Dao
+interface MembershipDao {
+    @Insert(onConflict = androidx.room.OnConflictStrategy.REPLACE)
+    suspend fun upsert(membership: LibraryMembershipEntity): Long
+
+    @Update
+    suspend fun update(membership: LibraryMembershipEntity)
+
+    @Query("SELECT * FROM library_memberships WHERE libraryId = :libraryId ORDER BY joinedAtMillis")
+    fun observeForLibrary(libraryId: Long): Flow<List<LibraryMembershipEntity>>
+
+    @Query("SELECT * FROM library_memberships WHERE libraryId = :libraryId AND userId = :userId LIMIT 1")
+    suspend fun find(libraryId: Long, userId: Long): LibraryMembershipEntity?
+
+    @Query("SELECT EXISTS(SELECT 1 FROM library_memberships WHERE userId = :userId AND role = 'Owner')")
+    suspend fun hasOwnerMembership(userId: Long): Boolean
+
+    @Query("DELETE FROM library_memberships WHERE id = :membershipId")
+    suspend fun delete(membershipId: Long)
+}
+
+@Dao
+interface MembershipRequestDao {
+    @Insert
+    suspend fun insert(request: MembershipRequestEntity): Long
+
+    @Update
+    suspend fun update(request: MembershipRequestEntity)
+
+    @Query("SELECT * FROM membership_requests WHERE libraryId = :libraryId ORDER BY requestedAtMillis DESC")
+    fun observeForLibrary(libraryId: Long): Flow<List<MembershipRequestEntity>>
+}
+
+@Dao
+interface AuditLogDao {
+    @Insert
+    suspend fun insert(log: AuditLogEntity): Long
+
+    @Query("SELECT * FROM audit_logs WHERE libraryId = :libraryId ORDER BY createdAtMillis DESC LIMIT :limit")
+    fun observeRecent(libraryId: Long, limit: Int = 50): Flow<List<AuditLogEntity>>
 }
 
 @Dao
@@ -360,11 +531,29 @@ interface CatalogDao {
     @Insert
     suspend fun insertCollections(collections: List<CollectionEntity>): List<Long>
 
+    @Insert
+    suspend fun insertCategory(category: LibraryCategoryEntity): Long
+
+    @Insert
+    suspend fun insertLanguage(language: LibraryLanguageEntity): Long
+
+    @Update
+    suspend fun updateCategory(category: LibraryCategoryEntity)
+
+    @Update
+    suspend fun updateLanguage(language: LibraryLanguageEntity)
+
     @Query("SELECT * FROM tags ORDER BY name COLLATE NOCASE")
     fun observeTags(): Flow<List<TagEntity>>
 
     @Query("SELECT * FROM collections ORDER BY name COLLATE NOCASE")
     fun observeCollections(): Flow<List<CollectionEntity>>
+
+    @Query("SELECT * FROM library_categories WHERE libraryId = :libraryId ORDER BY name COLLATE NOCASE")
+    fun observeCategories(libraryId: Long): Flow<List<LibraryCategoryEntity>>
+
+    @Query("SELECT * FROM library_languages WHERE libraryId = :libraryId ORDER BY name COLLATE NOCASE")
+    fun observeLanguages(libraryId: Long): Flow<List<LibraryLanguageEntity>>
 
     @Query("SELECT tags.* FROM tags INNER JOIN book_tags ON tags.id = book_tags.tagId WHERE book_tags.bookId = :bookId ORDER BY tags.name COLLATE NOCASE")
     fun observeTagsForBook(bookId: Long): Flow<List<TagEntity>>
@@ -396,6 +585,12 @@ interface CatalogDao {
     @Query("DELETE FROM collections WHERE id = :collectionId")
     suspend fun deleteCollection(collectionId: Long)
 
+    @Query("DELETE FROM library_categories WHERE id = :categoryId")
+    suspend fun deleteCategory(categoryId: Long)
+
+    @Query("DELETE FROM library_languages WHERE id = :languageId")
+    suspend fun deleteLanguage(languageId: Long)
+
     @Insert
     suspend fun insertTagAssignments(assignments: List<BookTagEntity>)
 
@@ -423,7 +618,7 @@ interface CatalogDao {
     }
 }
 
-@Database(entities = [BookEntity::class, BookImageEntity::class, LoanEntity::class, WishlistEntity::class, TagEntity::class, CollectionEntity::class, BookTagEntity::class, BookCollectionEntity::class, LibraryEntity::class, UserEntity::class], version = 13, exportSchema = false)
+@Database(entities = [BookEntity::class, BookImageEntity::class, LoanEntity::class, WishlistEntity::class, TagEntity::class, CollectionEntity::class, LibraryCategoryEntity::class, LibraryLanguageEntity::class, BookTagEntity::class, BookCollectionEntity::class, LibraryEntity::class, UserEntity::class, RoleEntity::class, PermissionEntity::class, LibraryMembershipEntity::class, MembershipRequestEntity::class, AuditLogEntity::class], version = 19, exportSchema = false)
 abstract class LibraryDatabase : RoomDatabase() {
     abstract fun bookDao(): BookDao
     abstract fun libraryDao(): LibraryDao
@@ -431,6 +626,9 @@ abstract class LibraryDatabase : RoomDatabase() {
     abstract fun wishlistDao(): WishlistDao
     abstract fun catalogDao(): CatalogDao
     abstract fun userDao(): UserDao
+    abstract fun membershipDao(): MembershipDao
+    abstract fun membershipRequestDao(): MembershipRequestDao
+    abstract fun auditLogDao(): AuditLogDao
 
     companion object {
         val MIGRATION_5_6 = object : Migration(5, 6) {
@@ -494,6 +692,63 @@ abstract class LibraryDatabase : RoomDatabase() {
             override fun migrate(database: SupportSQLiteDatabase) {
                 database.execSQL("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, username TEXT NOT NULL, passwordHash TEXT NOT NULL, isAdmin INTEGER NOT NULL, createdAtMillis INTEGER NOT NULL)")
                 database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_users_username ON users(username)")
+            }
+        }
+
+        val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE users ADD COLUMN displayName TEXT")
+            }
+        }
+
+        val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'User'")
+                database.execSQL("UPDATE users SET role = 'Administrator' WHERE isAdmin = 1")
+            }
+        }
+
+        val MIGRATION_15_16 = object : Migration(15, 16) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE users ADD COLUMN email TEXT")
+                database.execSQL("ALTER TABLE users ADD COLUMN avatarPath TEXT")
+                database.execSQL("UPDATE users SET role = 'Owner' WHERE role = 'Administrator'")
+                database.execSQL("UPDATE users SET role = 'Member' WHERE role = 'User'")
+                database.execSQL("CREATE TABLE IF NOT EXISTS roles (id TEXT NOT NULL, displayName TEXT NOT NULL, isSystemRole INTEGER NOT NULL, PRIMARY KEY(id))")
+                database.execSQL("CREATE TABLE IF NOT EXISTS permissions (id TEXT NOT NULL, displayName TEXT NOT NULL, PRIMARY KEY(id))")
+                database.execSQL("CREATE TABLE IF NOT EXISTS library_memberships (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, libraryId INTEGER NOT NULL, userId INTEGER NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL, joinedAtMillis INTEGER NOT NULL)")
+                database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_library_memberships_libraryId_userId ON library_memberships(libraryId, userId)")
+                database.execSQL("CREATE INDEX IF NOT EXISTS index_library_memberships_libraryId ON library_memberships(libraryId)")
+                database.execSQL("CREATE INDEX IF NOT EXISTS index_library_memberships_userId ON library_memberships(userId)")
+                database.execSQL("CREATE TABLE IF NOT EXISTS membership_requests (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, libraryId INTEGER NOT NULL, email TEXT NOT NULL, inviteCode TEXT NOT NULL, status TEXT NOT NULL, requestedAtMillis INTEGER NOT NULL, respondedAtMillis INTEGER)")
+                database.execSQL("CREATE INDEX IF NOT EXISTS index_membership_requests_libraryId ON membership_requests(libraryId)")
+                database.execSQL("CREATE INDEX IF NOT EXISTS index_membership_requests_email ON membership_requests(email)")
+                database.execSQL("CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, libraryId INTEGER NOT NULL, actorUserId INTEGER NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL, createdAtMillis INTEGER NOT NULL)")
+                database.execSQL("CREATE INDEX IF NOT EXISTS index_audit_logs_libraryId ON audit_logs(libraryId)")
+                database.execSQL("CREATE INDEX IF NOT EXISTS index_audit_logs_createdAtMillis ON audit_logs(createdAtMillis)")
+            }
+        }
+
+        val MIGRATION_16_17 = object : Migration(16, 17) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("CREATE TABLE IF NOT EXISTS library_categories (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, libraryId INTEGER NOT NULL, name TEXT NOT NULL)")
+                database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_library_categories_libraryId_name ON library_categories(libraryId, name)")
+                database.execSQL("CREATE TABLE IF NOT EXISTS library_languages (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, libraryId INTEGER NOT NULL, name TEXT NOT NULL)")
+                database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_library_languages_libraryId_name ON library_languages(libraryId, name)")
+            }
+        }
+
+        val MIGRATION_17_18 = object : Migration(17, 18) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE users ADD COLUMN accountStatus TEXT NOT NULL DEFAULT 'Active'")
+                database.execSQL("ALTER TABLE users ADD COLUMN forcePasswordReset INTEGER NOT NULL DEFAULT 0")
+                database.execSQL("ALTER TABLE users ADD COLUMN lastLoginAtMillis INTEGER")
+            }
+        }
+
+        val MIGRATION_18_19 = object : Migration(18, 19) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE books ADD COLUMN barcode TEXT")
             }
         }
     }

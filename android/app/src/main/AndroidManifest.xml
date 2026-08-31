@@ -5,7 +5,7 @@
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
-        android:label="Venkatesh Gowdas Personal Library"
+        android:label="Library management"
         android:roundIcon="@mipmap/ic_launcher"
         android:theme="@style/Theme.PersonalLibrary"
         android:usesCleartextTraffic="false">
