@@ -153,7 +153,6 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.withContext
 import coil.compose.AsyncImage
@@ -196,6 +195,7 @@ fun LibraryApp(bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishl
     var logoMenuExpanded by rememberSaveable { mutableStateOf(false) }
     var homeSearchQuery by rememberSaveable { mutableStateOf("") }
     var signedInUser by remember { mutableStateOf<UserEntity?>(null) }
+    var savedSignedInUserId by rememberSaveable { mutableStateOf<Long?>(null) }
     var switchBackUser by remember { mutableStateOf<UserEntity?>(null) }
     var sessionRestored by remember { mutableStateOf(false) }
     val accessRepository = remember(database) { LibraryAccessRepository(database) }
@@ -220,14 +220,11 @@ fun LibraryApp(bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishl
         val user = signedInUser
         if (libraryId != null && user != null) accessRepository.ensureMembership(libraryId, user)
     }
-    LaunchedEffect(Unit) {
-        val userId = settings.signedInUserId.first()
-        if (userId != null) {
-            signedInUser = userDao.findById(userId)
-            if (signedInUser == null) settings.clearSignedInUser()
-        }
+    LaunchedEffect(savedSignedInUserId) {
+        signedInUser = savedSignedInUserId?.let { userDao.findById(it) }
         sessionRestored = true
     }
+    LaunchedEffect(Unit) { settings.clearSignedInUser() }
     LaunchedEffect(Unit) {
         val defaultPasswordHash = PasswordHasher.hash("admin123".toCharArray())
         val admin = userDao.findByUsername("admin")
@@ -271,6 +268,7 @@ fun LibraryApp(bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishl
                                         logoMenuExpanded = false
                                         switchBackUser = null
                                         signedInUser = null
+                                        savedSignedInUserId = null
                                         scope.launch { settings.clearSignedInUser() }
                                     }
                                 )
@@ -324,7 +322,7 @@ fun LibraryApp(bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishl
         settings,
         signedInUser!!,
         { settingsVisible = false },
-        { signedInUser = null; settingsVisible = false; scope.launch { settings.clearSignedInUser() }; activity?.finishAndRemoveTask() },
+        { signedInUser = null; savedSignedInUserId = null; settingsVisible = false; scope.launch { settings.clearSignedInUser(); activity?.finishAndRemoveTask() } },
         {
             switchBackUser = signedInUser
             signedInUser = null
@@ -335,7 +333,7 @@ fun LibraryApp(bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishl
         onDismissRequest = { exitConfirmationVisible = false },
         title = { Text("Exit app?") },
         text = { Text("Your library data is saved on this device.") },
-        confirmButton = { Button(onClick = { activity?.finishAndRemoveTask() }) { Text("Exit") } },
+        confirmButton = { Button(onClick = { signedInUser = null; savedSignedInUserId = null; scope.launch { settings.clearSignedInUser(); activity?.finishAndRemoveTask() } }) { Text("Exit") } },
         dismissButton = { TextButton(onClick = { exitConfirmationVisible = false }) { Text("Cancel") } }
     )
     if (!onboardingComplete) OnboardingDialog(onNewCatalogue = { scope.launch { settings.setOnboardingComplete() } }, onImport = { scope.launch { settings.setOnboardingComplete() }; destination = Destination.More })
@@ -344,8 +342,8 @@ fun LibraryApp(bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishl
             userDao = userDao,
             onSignedIn = {
                 signedInUser = it
+                savedSignedInUserId = it.id
                 switchBackUser = null
-                scope.launch { settings.setSignedInUserId(it.id) }
             },
             onCancel = {
                 val previousUser = switchBackUser
