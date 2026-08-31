@@ -6,6 +6,8 @@ import android.app.DatePickerDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.sqlite.SQLiteDatabase
+import android.graphics.Paint
+import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -34,6 +36,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -53,12 +56,15 @@ import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.Favorite
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.LocalLibrary
 import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material.icons.outlined.People
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material.icons.outlined.Visibility
@@ -89,6 +95,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material.ExperimentalMaterialApi
+import androidx.compose.material.pullrefresh.PullRefreshIndicator
+import androidx.compose.material.pullrefresh.pullRefresh
+import androidx.compose.material.pullrefresh.rememberPullRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -107,6 +117,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.shape.CircleShape
@@ -154,6 +165,7 @@ import androidx.core.content.FileProvider
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import coil.compose.AsyncImage
 import java.io.ByteArrayOutputStream
@@ -172,7 +184,7 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import java.util.zip.ZipInputStream
 
-private enum class Destination(val label: String, val phoneLabel: String = label) { Dashboard("Dashboard", "Home"), Library("Library"), Search("Search"), Loans("Loans"), More("More") }
+private enum class Destination(val label: String, val phoneLabel: String = label) { Dashboard("Dashboard", "Home"), Books("Books"), Library("Library"), Search("Search"), Loans("Loans"), More("More") }
 
 private enum class CatalogItemKind { Tag, Collection, Category, Language }
 
@@ -303,6 +315,7 @@ fun LibraryApp(bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishl
                             onNavigate = { destination = it },
                             onSearch = { query -> homeSearchQuery = query; destination = Destination.Search }
                         )
+                        Destination.Books -> BooksScreen(bookDao, libraryDao, contentModifier, canModify, canDelete, { editedBook = it; editorVisible = true })
                         Destination.Library -> LibraryScreen(bookDao, libraryDao, wishlistDao, activeLibraryId, activeLibrary?.name ?: "Personal Library", libraries.size, contentModifier, canModify, canManageWishlist, canDelete, { editedBook = null; editorVisible = true }, { editedBook = it; editorVisible = true }, { wishlistVisible = true }, { catalogVisible = true }, { libraryManagerVisible = true }, { libraryCreatorVisible = true })
                         Destination.Search -> SearchScreen(bookDao, catalogDao, settings, activeLibraryId, activeLibrary?.name ?: "Personal Library", libraries.size, homeSearchQuery, contentModifier, canModify, canDelete, { editedBook = it; editorVisible = true })
                         Destination.More -> MoreScreenImproved(database, bookDao, libraryDao, loanDao, wishlistDao, userDao, activeLibrary?.name.orEmpty(), activeLibraryId, signedInUser, contentModifier, canManageSettings, { settingsVisible = true })
@@ -1216,6 +1229,171 @@ private fun LibraryScreen(bookDao: BookDao, libraryDao: LibraryDao, wishlistDao:
     }
 }
 
+@OptIn(ExperimentalMaterialApi::class)
+@Composable
+private fun BooksScreen(bookDao: BookDao, libraryDao: LibraryDao, modifier: Modifier, canModify: Boolean, canDelete: Boolean, onEdit: (BookEntity) -> Unit) {
+    val allBooks by bookDao.observeAll().collectAsState(emptyList())
+    val libraries by libraryDao.observeAll().collectAsState(emptyList())
+    val scope = rememberCoroutineScope()
+    var query by rememberSaveable { mutableStateOf("") }
+    var refreshing by rememberSaveable { mutableStateOf(false) }
+    var selectedBook by remember { mutableStateOf<BookEntity?>(null) }
+    var filtersVisible by rememberSaveable { mutableStateOf(false) }
+    var sort by rememberSaveable { mutableStateOf("Recently Added") }
+    var libraryFilter by rememberSaveable { mutableStateOf(0L) }
+    var categoryFilter by rememberSaveable { mutableStateOf("") }
+    var authorFilter by rememberSaveable { mutableStateOf("") }
+    var statusFilter by rememberSaveable { mutableStateOf("") }
+    var favouritesOnly by rememberSaveable { mutableStateOf(false) }
+    var bookPendingDeletion by remember { mutableStateOf<BookEntity?>(null) }
+    val listState = rememberLazyListState()
+    val normalizedQuery = query.trim().lowercase()
+    val books = allBooks.asSequence()
+        .filter { book -> libraryFilter == 0L || book.libraryId == libraryFilter }
+        .filter { book -> categoryFilter.isBlank() || book.category.orEmpty().equals(categoryFilter, ignoreCase = true) }
+        .filter { book -> authorFilter.isBlank() || book.author.equals(authorFilter, ignoreCase = true) }
+        .filter { book -> statusFilter.isBlank() || book.readingStatus.equals(statusFilter, ignoreCase = true) }
+        .filter { book -> !favouritesOnly || book.favourite }
+        .filter { book -> normalizedQuery.isBlank() || listOf(book.title, book.author, book.category.orEmpty(), book.publisher.orEmpty(), book.isbn.orEmpty()).any { value -> value.lowercase().contains(normalizedQuery) } }
+        .let { results -> when (sort) {
+            "Oldest Added" -> results.sortedBy { it.createdAtMillis }
+            "Title A-Z" -> results.sortedBy { it.title.lowercase() }
+            "Title Z-A" -> results.sortedByDescending { it.title.lowercase() }
+            "Author Name" -> results.sortedBy { it.author.lowercase() }
+            "Purchase Date" -> results.sortedByDescending { it.purchaseDate.orEmpty() }
+            "Rating" -> results.sortedByDescending { it.rating ?: 0 }
+            "Price" -> results.sortedByDescending { it.pricePaise }
+            else -> results.sortedByDescending { it.createdAtMillis }
+        } }
+        .toList()
+    val pullRefreshState = rememberPullRefreshState(refreshing = refreshing, onRefresh = { refreshing = true })
+    LaunchedEffect(refreshing) {
+        if (refreshing) {
+            bookDao.allBooks()
+            delay(300)
+            refreshing = false
+        }
+    }
+    Column(modifier.fillMaxSize().padding(20.dp)) {
+        ScreenHeader("Your Books", "Browse and manage your complete collection") {
+            Row {
+                IconButton(onClick = { filtersVisible = true }) { Icon(Icons.Outlined.Settings, contentDescription = "Filter and sort books") }
+                IconButton(onClick = { refreshing = true }) { Icon(Icons.Outlined.Refresh, contentDescription = "Refresh books") }
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        OutlinedTextField(query, { query = it }, label = { Text("Search title, author, category, publisher, or ISBN") }, leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(12.dp))
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            item { BooksSummaryChip("Total", allBooks.size) }
+            item { BooksSummaryChip("Read", allBooks.count { it.readingStatus.equals("Read", true) || it.readingStatus.equals("Completed", true) }) }
+            item { BooksSummaryChip("Reading", allBooks.count { it.readingStatus.equals("Reading", true) }) }
+            item { BooksSummaryChip("Unread", allBooks.count { it.readingStatus.equals("Unread", true) }) }
+            item { BooksSummaryChip("Favourites", allBooks.count { it.favourite }) }
+        }
+        Spacer(Modifier.height(10.dp))
+        Text("${books.size} ${if (books.size == 1) "book" else "books"} | $sort", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(8.dp))
+        Box(Modifier.weight(1f).fillMaxWidth().pullRefresh(pullRefreshState)) {
+            if (allBooks.isEmpty()) EmptyContentState("No books yet", if (canModify) "Add your first book from Library." else "No books have been added to this library yet.")
+            else if (books.isEmpty()) EmptyContentState("No books found", "Try another title, author, category, publisher, or ISBN.")
+            else LazyColumn(state = listState, verticalArrangement = Arrangement.spacedBy(10.dp)) { items(books, key = { it.id }) { book -> YourBookCard(book, libraries.firstOrNull { it.id == book.libraryId }?.name ?: "Unknown library", canModify, canDelete, onDetails = { selectedBook = book }, onEdit = { onEdit(book) }, onDelete = { bookPendingDeletion = book }, onFavourite = { updated -> scope.launch { bookDao.update(updated) } }, onStatus = { updated -> scope.launch { bookDao.update(updated) } }) } }
+            PullRefreshIndicator(refreshing, pullRefreshState, Modifier.align(Alignment.TopCenter))
+        }
+    }
+    selectedBook?.let { book -> BookInformationDialog(book, libraries.firstOrNull { it.id == book.libraryId }?.name ?: "Unknown library", canModify, onDismiss = { selectedBook = null }, onEdit = { selectedBook = null; onEdit(book) }) }
+    bookPendingDeletion?.let { book -> AlertDialog(onDismissRequest = { bookPendingDeletion = null }, title = { Text("Delete book?") }, text = { Text("${book.title} will be permanently deleted.") }, confirmButton = { Button(onClick = { scope.launch { bookDao.delete(book.id); CoverStorage.delete(book.coverImagePath); bookPendingDeletion = null } }) { Text("Delete") } }, dismissButton = { TextButton(onClick = { bookPendingDeletion = null }) { Text("Cancel") } }) }
+    if (filtersVisible) BooksFilterDialog(libraries, allBooks, sort, libraryFilter, categoryFilter, authorFilter, statusFilter, favouritesOnly, onApply = { newSort, newLibrary, newCategory, newAuthor, newStatus, newFavouritesOnly -> sort = newSort; libraryFilter = newLibrary; categoryFilter = newCategory; authorFilter = newAuthor; statusFilter = newStatus; favouritesOnly = newFavouritesOnly; filtersVisible = false }, onDismiss = { filtersVisible = false })
+}
+
+@Composable
+private fun BooksSummaryChip(label: String, count: Int) {
+    Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.secondaryContainer) { Text("$label $count", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSecondaryContainer) }
+}
+
+@Composable
+private fun YourBookCard(book: BookEntity, libraryName: String, canModify: Boolean, canDelete: Boolean, onDetails: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit, onFavourite: (BookEntity) -> Unit, onStatus: (BookEntity) -> Unit) {
+    var actionsVisible by remember { mutableStateOf(false) }
+    Card(Modifier.fillMaxWidth().clickable(onClick = onDetails), shape = RoundedCornerShape(12.dp)) {
+        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (book.coverImagePath != null) AsyncImage(model = book.coverImagePath, contentDescription = "Cover for ${book.title}", contentScale = ContentScale.Crop, modifier = Modifier.size(64.dp, 88.dp).clip(RoundedCornerShape(8.dp)))
+            else Box(Modifier.size(64.dp, 88.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.secondaryContainer), contentAlignment = Alignment.Center) { Icon(Icons.Outlined.LocalLibrary, contentDescription = null, tint = MaterialTheme.colorScheme.onSecondaryContainer) }
+            Column(Modifier.padding(start = 12.dp).weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(book.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(book.author, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(book.category ?: "Uncategorized", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(libraryName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                book.purchaseDate?.let { Text("Purchased $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(book.readingStatus, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    book.rating?.let { rating -> Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Outlined.Star, contentDescription = null, modifier = Modifier.size(15.dp), tint = Color(0xFFF0A500)); Text(rating.toString(), style = MaterialTheme.typography.labelSmall) } }
+                    if (book.favourite) Icon(Icons.Outlined.Favorite, contentDescription = "Favourite", modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                }
+            }
+            Box {
+                IconButton(onClick = { actionsVisible = true }) { Icon(Icons.Outlined.MoreHoriz, contentDescription = "Actions for ${book.title}") }
+                DropdownMenu(expanded = actionsVisible, onDismissRequest = { actionsVisible = false }) {
+                    DropdownMenuItem(text = { Text("View details") }, onClick = { actionsVisible = false; onDetails() })
+                    if (canModify) {
+                        DropdownMenuItem(text = { Text("Edit book") }, onClick = { actionsVisible = false; onEdit() })
+                        DropdownMenuItem(text = { Text(if (book.favourite) "Remove favourite" else "Mark as favourite") }, onClick = { actionsVisible = false; onFavourite(book.copy(favourite = !book.favourite, updatedAtMillis = System.currentTimeMillis())) })
+                        DropdownMenuItem(text = { Text("Update reading status") }, onClick = { actionsVisible = false; onStatus(book.copy(readingStatus = nextReadingStatus(book.readingStatus), updatedAtMillis = System.currentTimeMillis())) })
+                    }
+                    if (canDelete) DropdownMenuItem(text = { Text("Delete book", color = MaterialTheme.colorScheme.error) }, onClick = { actionsVisible = false; onDelete() })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BookInformationDialog(book: BookEntity, libraryName: String, canModify: Boolean, onDismiss: () -> Unit, onEdit: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Book information") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (book.coverImagePath != null) AsyncImage(model = book.coverImagePath, contentDescription = "Cover for ${book.title}", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxWidth().height(220.dp).clip(RoundedCornerShape(8.dp)))
+                Text(book.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(book.author, style = MaterialTheme.typography.titleMedium)
+                Text("Category: ${book.category ?: "Uncategorized"}")
+                Text("Library: $libraryName")
+                Text("Price: ${formatInr(book.pricePaise)}")
+                book.purchaseDate?.let { Text("Purchase date: $it") }
+                Text("Reading status: ${book.readingStatus}")
+                Text("Rating: ${book.rating?.toString() ?: "Not rated"}")
+                Text("Favourite: ${if (book.favourite) "Yes" else "No"}")
+                book.publisher?.let { Text("Publisher: $it") }
+                book.isbn?.let { Text("ISBN: $it") }
+                book.barcode?.let { Text("Book barcode: $it") }
+                book.language?.let { Text("Language: $it") }
+            }
+        },
+        confirmButton = { if (canModify) TextButton(onClick = onEdit) { Text("Edit") } else TextButton(onClick = onDismiss) { Text("Close") } },
+        dismissButton = { if (canModify) TextButton(onClick = onDismiss) { Text("Close") } }
+    )
+}
+
+private fun nextReadingStatus(status: String) = when (status.lowercase()) { "unread" -> "Reading"; "reading", "in progress" -> "Completed"; else -> "Unread" }
+
+@Composable
+private fun BooksFilterDialog(libraries: List<LibraryEntity>, books: List<BookEntity>, initialSort: String, initialLibrary: Long, initialCategory: String, initialAuthor: String, initialStatus: String, initialFavouritesOnly: Boolean, onApply: (String, Long, String, String, String, Boolean) -> Unit, onDismiss: () -> Unit) {
+    var sort by rememberSaveable { mutableStateOf(initialSort) }
+    var libraryId by rememberSaveable { mutableStateOf(initialLibrary) }
+    var category by rememberSaveable { mutableStateOf(initialCategory) }
+    var author by rememberSaveable { mutableStateOf(initialAuthor) }
+    var status by rememberSaveable { mutableStateOf(initialStatus) }
+    var favouritesOnly by rememberSaveable { mutableStateOf(initialFavouritesOnly) }
+    AlertDialog(onDismissRequest = onDismiss, title = { Text("Sort and filter") }, text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        ManagedCatalogDropdown("Sort", sort, listOf("Recently Added", "Oldest Added", "Title A-Z", "Title Z-A", "Author Name", "Purchase Date", "Rating", "Price")) { sort = it }
+        ManagedCatalogDropdown("Library", libraries.firstOrNull { it.id == libraryId }?.name.orEmpty(), listOf("All libraries") + libraries.map { it.name }) { selected -> libraryId = libraries.firstOrNull { it.name == selected }?.id ?: 0L }
+        ManagedCatalogDropdown("Category", category, books.mapNotNull { it.category }.distinct().sorted()) { category = it }
+        ManagedCatalogDropdown("Author", author, books.map { it.author }.distinct().sorted()) { author = it }
+        ManagedCatalogDropdown("Reading status", status, listOf("Unread", "Reading", "Completed")) { status = it }
+        Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(favouritesOnly, { favouritesOnly = it }); Text("Favourite books only") }
+    } }, confirmButton = { TextButton(onClick = { onApply(sort, libraryId, category, author, status, favouritesOnly) }) { Text("Apply") } }, dismissButton = { TextButton(onClick = { onApply("Recently Added", 0L, "", "", "", false) }) { Text("Clear") } })
+}
+
 @Composable
 private fun LibraryManagementDialog(libraryDao: LibraryDao, activeLibraryId: Long?, canModify: Boolean, canDelete: Boolean, onSelect: (Long) -> Unit, onDismiss: () -> Unit) {
     val libraries by libraryDao.observeAll().collectAsState(emptyList())
@@ -1460,20 +1638,20 @@ private fun MoreScreenImproved(database: LibraryDatabase, bookDao: BookDao, libr
     var message by rememberSaveable { mutableStateOf<String?>(null) }
     var csvPayload by remember { mutableStateOf<ByteArray?>(null) }
     var xlsxPayload by remember { mutableStateOf<ByteArray?>(null) }
+    var pdfPayload by remember { mutableStateOf<ByteArray?>(null) }
     var reportsVisible by rememberSaveable { mutableStateOf(false) }
     var aboutVisible by rememberSaveable { mutableStateOf(false) }
     var backupVisible by rememberSaveable { mutableStateOf(false) }
     var usersVisible by rememberSaveable { mutableStateOf(false) }
-    val books by (activeLibraryId?.let { bookDao.observeForLibrary(it) } ?: flowOf(emptyList())).collectAsState(emptyList())
+    val books by bookDao.observeAll().collectAsState(emptyList())
     val libraries by libraryDao.observeAll().collectAsState(emptyList())
     val users by userDao.observeAll().collectAsState(emptyList())
     val loans by loanDao.observeAll().collectAsState(emptyList())
-    val wishlist by (activeLibraryId?.let { wishlistDao.observeForLibrary(it) } ?: flowOf(emptyList())).collectAsState(emptyList())
-    val report = ReportExportService.summary(books, loans, wishlist, LocalDate.now().toString())
-    val advancedReport = ReportExportService.advancedSummary(books, loans, wishlist, LocalDate.now().toString())
+    val wishlist by wishlistDao.observeAll().collectAsState(emptyList())
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) scope.launch { message = try { "Imported ${LegacyImportService(context, database).importArchive(uri)} books." } catch (error: Exception) { error.message ?: "Could not import archive." } } }
     val csvLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri -> if (uri != null && csvPayload != null) { context.contentResolver.openOutputStream(uri)?.use { it.write(csvPayload) }; message = "CSV export saved." } }
     val xlsxLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) { uri -> if (uri != null && xlsxPayload != null) { context.contentResolver.openOutputStream(uri)?.use { it.write(xlsxPayload) }; message = "XLSX export saved." } }
+    val pdfLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri -> if (uri != null && pdfPayload != null) { context.contentResolver.openOutputStream(uri)?.use { it.write(pdfPayload) }; message = "PDF report saved." } }
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
         ScreenHeader("More", "Your library command centre") {}
         Spacer(Modifier.height(16.dp))
@@ -1525,7 +1703,15 @@ private fun MoreScreenImproved(database: LibraryDatabase, bookDao: BookDao, libr
         }
         if (message != null) Text(message!!, modifier = Modifier.padding(top = 16.dp), color = MaterialTheme.colorScheme.error)
     }
-    if (reportsVisible) ReportsDialog(report, advancedReport, onDismiss = { reportsVisible = false })
+    if (reportsVisible) ReportsDashboardDialog(
+        books, libraries, loans, wishlist,
+        onDismiss = { reportsVisible = false },
+        onExportExcel = { xlsxPayload = ReportExportService.workbook(books, wishlist, loans, LocalDate.now().toString()); xlsxLauncher.launch("library-report.xlsx") },
+        onExportPdf = { pdfPayload = createReportPdf(books, libraries, loans); pdfLauncher.launch("library-report.pdf") },
+        onShare = {
+            context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, reportShareText(books, libraries, loans)), "Share library report"))
+        }
+    )
     if (aboutVisible) AboutAppDialog(onDismiss = { aboutVisible = false })
     if (backupVisible) BackupDialog(database, onDismiss = { backupVisible = false })
     if (usersVisible && activeLibraryId != null && signedInUser != null) UserRolesDialog(activeLibraryId, signedInUser, accessRepository, onDismiss = { usersVisible = false })
@@ -1678,6 +1864,84 @@ private fun ReportsDialog(report: com.venkateshgowda.personallibrary.data.Report
 }
 
 @Composable
+private fun ReportsDashboardDialog(books: List<BookEntity>, libraries: List<LibraryEntity>, loans: List<LoanEntity>, wishlist: List<WishlistEntity>, onDismiss: () -> Unit, onExportExcel: () -> Unit, onExportPdf: () -> Unit, onShare: () -> Unit) {
+    val today = LocalDate.now()
+    val completed = books.filter { it.readingStatus.equals("Read", true) || it.readingStatus.equals("Completed", true) }
+    val reading = books.count { it.readingStatus.equals("Reading", true) || it.readingStatus.equals("In progress", true) }
+    val unread = books.count { it.readingStatus.equals("Unread", true) }
+    val categories = reportCount(books) { it.category ?: "Uncategorized" }
+    val authors = reportCount(books) { it.author }
+    val publishers = reportCount(books) { it.publisher ?: "Unknown publisher" }
+    val languages = reportCount(books) { it.language ?: "Unspecified" }
+    val statuses = reportCount(books) { it.readingStatus }
+    val libraryNames = reportCount(books) { book -> libraries.firstOrNull { it.id == book.libraryId }?.name ?: "Unknown library" }
+    val spendingByCategory = reportAmount(books) { it.category ?: "Uncategorized" }
+    val spendingByMonth = reportAmount(books.filter { !it.purchaseDate.isNullOrBlank() }) { it.purchaseDate!!.take(7) }
+    val spendingByYear = reportAmount(books.filter { !it.purchaseDate.isNullOrBlank() }) { it.purchaseDate!!.take(4) }
+    val addedThisWeek = books.count { it.createdAtMillis >= today.minusDays(7).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
+    val addedThisMonth = books.count { it.createdAtMillis >= today.withDayOfMonth(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
+    val addedThisYear = books.count { it.createdAtMillis >= today.withDayOfYear(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
+    val readThisMonth = completed.count { it.updatedAtMillis >= today.withDayOfMonth(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
+    val readThisYear = completed.count { it.updatedAtMillis >= today.withDayOfYear(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
+    val averageRating = books.mapNotNull { it.rating }.average().takeIf { !it.isNaN() }
+    val activeLoans = loans.filter { it.actualReturnDate == null }
+    val overdue = activeLoans.filter { !it.expectedReturnDate.isNullOrBlank() && it.expectedReturnDate < today.toString() }
+    val borrowers = reportLoanCount(activeLoans) { it.borrowerName }
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = MaterialTheme.shapes.extraLarge, modifier = Modifier.fillMaxSize().padding(12.dp)) {
+            Column(Modifier.padding(20.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) { Text("Library reports", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Text("Local collection insights", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    IconButton(onClick = onDismiss) { Icon(Icons.Outlined.MoreHoriz, contentDescription = "Close reports") }
+                }
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.weight(1f)) {
+                    item { ReportMetricGrid(listOf("Total books" to books.size.toString(), "Authors" to authors.size.toString(), "Categories" to categories.size.toString(), "Favourites" to books.count { it.favourite }.toString(), "Reading" to reading.toString(), "Completed" to completed.size.toString(), "Unread" to unread.toString(), "Libraries" to libraries.size.toString())) }
+                    item { ReportSection("Reading analytics") { ReportInsight("Progress", "${completed.size} of ${books.size} completed (${if (books.isEmpty()) 0 else completed.size * 100 / books.size}%)"); ReportInsight("Books read", "$readThisMonth this month | $readThisYear this year"); ReportInsight("Average rating", averageRating?.let { "%.1f / 5".format(it) } ?: "No ratings yet"); ReportBarChart("Reading status", statuses); ReportBookList("Top rated books", books.filter { it.rating != null }.sortedByDescending { it.rating }.take(5)) } }
+                    item { ReportSection("Collection reports") { ReportBarChart("Books by category", categories); ReportBarChart("Books by author", authors); ReportBarChart("Books by publisher", publishers); ReportBarChart("Books by library", libraryNames); ReportBarChart("Books by language", languages) } }
+                    item { ReportSection("Financial reports") { ReportInsight("Total investment", formatInr(books.sumOf { it.pricePaise })); ReportInsight("Average book price", if (books.isEmpty()) formatInr(0) else formatInr(books.sumOf { it.pricePaise } / books.size)); ReportBarChart("Spending by month", spendingByMonth, true); ReportBarChart("Spending by year", spendingByYear, true); ReportBarChart("Spending by category", spendingByCategory, true); ReportBookList("Most expensive books", books.sortedByDescending { it.pricePaise }.take(5), true) } }
+                    item { ReportSection("Library growth") { ReportInsight("Books added", "$addedThisWeek this week | $addedThisMonth this month | $addedThisYear this year"); ReportBarChart("Collection growth trend", reportCount(books) { java.time.Instant.ofEpochMilli(it.createdAtMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate().toString().take(7) }); ReportBookList("Recently added", books.sortedByDescending { it.createdAtMillis }.take(5)) } }
+                    item { ReportSection("Author insights") { ReportBarChart("Authors with most books", authors); ReportInsight("Favourite author", books.filter { it.favourite }.groupingBy { it.author }.eachCount().maxByOrNull { it.value }?.key ?: "No favourites yet") } }
+                    item { ReportSection("Borrowing reports") { ReportInsight("Lent books", activeLoans.size.toString()); ReportInsight("Overdue books", overdue.size.toString()); ReportBarChart("Most active borrowers", borrowers) } }
+                    item { ReportSection("Reading insights") { ReportInsight("Collection focus", categories.firstOrNull()?.let { "${it.label} books make up ${if (books.isEmpty()) 0 else it.value * 100 / books.size}% of your collection." } ?: "Add books to discover patterns."); ReportInsight("Unread investment", "You have $unread unread books worth ${formatInr(books.filter { it.readingStatus.equals("Unread", true) }.sumOf { it.pricePaise })}."); ReportInsight("Wishlist", "${wishlist.size} books are planned for your collection.") } }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) { TextButton(onClick = onShare) { Text("Share") }; TextButton(onClick = onExportPdf) { Text("PDF") }; Button(onClick = onExportExcel) { Text("Excel") } }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReportMetricGrid(metrics: List<Pair<String, String>>) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { metrics.chunked(2).forEach { row -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { row.forEach { (label, value) -> MetricCard(label, value, Modifier.weight(1f)) }; if (row.size == 1) Spacer(Modifier.weight(1f)) } } }
+}
+
+@Composable
+private fun ReportSection(title: String, content: @Composable () -> Unit) { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold); content() } }
+
+@Composable
+private fun ReportInsight(label: String, value: String) { Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant), shape = RoundedCornerShape(8.dp)) { Row(Modifier.padding(12.dp), verticalAlignment = Alignment.Top) { Text(label, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(0.46f).padding(end = 12.dp)); Text(value, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.End, modifier = Modifier.weight(0.54f)) } } }
+
+@Composable
+private fun ReportBookList(title: String, books: List<BookEntity>, showPrice: Boolean = false) { if (books.isNotEmpty()) { Text(title, style = MaterialTheme.typography.titleMedium); books.forEach { book -> ReportInsight(book.title, if (showPrice) formatInr(book.pricePaise) else "${book.author}${book.rating?.let { " | $it / 5" }.orEmpty()}") } } }
+
+private fun reportCount(books: List<BookEntity>, label: (BookEntity) -> String) = books.groupingBy(label).eachCount().entries.sortedByDescending { it.value }.map { ReportBreakdown(it.key, it.value.toLong()) }
+private fun reportAmount(books: List<BookEntity>, label: (BookEntity) -> String) = books.groupBy(label).map { (name, matching) -> ReportBreakdown(name, matching.sumOf { it.pricePaise }) }.sortedByDescending { it.value }
+private fun reportLoanCount(loans: List<LoanEntity>, label: (LoanEntity) -> String) = loans.groupingBy(label).eachCount().entries.sortedByDescending { it.value }.map { ReportBreakdown(it.key, it.value.toLong()) }
+
+private fun reportShareText(books: List<BookEntity>, libraries: List<LibraryEntity>, loans: List<LoanEntity>) = "Library report\n${books.size} books across ${libraries.size} libraries\n${books.count { it.favourite }} favourites\n${loans.count { it.actualReturnDate == null }} active loans\nInvestment: ${formatInr(books.sumOf { it.pricePaise })}"
+
+private fun createReportPdf(books: List<BookEntity>, libraries: List<LibraryEntity>, loans: List<LoanEntity>): ByteArray = ByteArrayOutputStream().use { output ->
+    val document = PdfDocument()
+    val page = document.startPage(PdfDocument.PageInfo.Builder(595, 842, 1).create())
+    val paint = Paint().apply { textSize = 16f }
+    listOf("Library Report", "Generated: ${LocalDate.now()}", "Total books: ${books.size}", "Total libraries: ${libraries.size}", "Favourite books: ${books.count { it.favourite }}", "Active loans: ${loans.count { it.actualReturnDate == null }}", "Total investment: ${formatInr(books.sumOf { it.pricePaise })}").forEachIndexed { index, line -> page.canvas.drawText(line, 48f, 64f + index * 32f, paint) }
+    document.finishPage(page)
+    document.writeTo(output)
+    document.close()
+    output.toByteArray()
+}
+
+@Composable
 private fun MoreScreen(database: LibraryDatabase, bookDao: BookDao, loanDao: LoanDao, wishlistDao: WishlistDao, modifier: Modifier, onSettings: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -1723,7 +1987,10 @@ private fun ReportBarChart(title: String, entries: List<ReportBreakdown>, showCu
     Text(title, style = MaterialTheme.typography.titleMedium)
     entries.take(5).forEach { entry ->
         val valueText = if (showCurrency) formatInr(entry.value) else entry.value.toString()
-        Text("${entry.label}: $valueText", style = MaterialTheme.typography.bodyMedium)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(entry.label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(end = 12.dp))
+            Text(valueText, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.End)
+        }
         LinearProgressIndicator(
             progress = (entry.value.toFloat() / maximum).coerceIn(0f, 1f),
             modifier = Modifier.fillMaxWidth().height(12.dp)
@@ -2518,6 +2785,6 @@ private fun MetricCard(label: String, value: String, modifier: Modifier) { Card(
 @Composable
 private fun MessageScreen(title: String, message: String, modifier: Modifier) { Column(modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) { Text(title, style = MaterialTheme.typography.headlineMedium); Text(message) } }
 
-private fun iconFor(destination: Destination) = when (destination) { Destination.Dashboard -> Icons.Outlined.Home; Destination.Library -> Icons.Outlined.LocalLibrary; Destination.Search -> Icons.Outlined.Search; Destination.Loans -> Icons.Outlined.SwapHoriz; Destination.More -> Icons.Outlined.MoreHoriz }
+private fun iconFor(destination: Destination) = when (destination) { Destination.Dashboard -> Icons.Outlined.Home; Destination.Books -> Icons.Outlined.LocalLibrary; Destination.Library -> Icons.Outlined.LocalLibrary; Destination.Search -> Icons.Outlined.Search; Destination.Loans -> Icons.Outlined.SwapHoriz; Destination.More -> Icons.Outlined.MoreHoriz }
 private fun formatInr(paise: Long) = "INR %.2f".format(paise / 100.0)
 private fun normalizeForDuplicate(value: String) = value.lowercase().filter { it.isLetterOrDigit() }
