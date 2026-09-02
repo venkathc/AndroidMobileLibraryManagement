@@ -61,6 +61,13 @@ Use **Library** to create and switch libraries.
 - Books, wishlist items, loans, dashboard totals, search, reports, and exports use the selected library.
 - Existing catalogues are retained in the migrated `Personal Library` after installing an update.
 
+## Browse and search
+
+- The **Books** summary tabs are interactive: select **Total**, **Read**, **Reading**, **Unread**, or **Favourites** to show only that group. Selecting the active tab returns to the full list.
+- The Books filter menu provides sort order plus library, category, author, reading-status, and favourite-only filters.
+- **Search** keeps smart fuzzy matching and provides the same sort options and dropdown filters as Books, including library, category, author, reading status, tag, collection, and favourites.
+- Search opens scoped to the currently selected library; choose **All libraries** in its filter menu to search across every library.
+
 ## Test
 
 ```bash

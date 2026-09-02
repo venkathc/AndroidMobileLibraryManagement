@@ -53,6 +53,7 @@ import androidx.compose.material.icons.outlined.Backup
 import androidx.compose.material.icons.outlined.Bookmark
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Edit
@@ -71,6 +72,7 @@ import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -317,9 +319,9 @@ fun LibraryApp(bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishl
                         )
                         Destination.Books -> BooksScreen(bookDao, libraryDao, contentModifier, canModify, canDelete, { editedBook = it; editorVisible = true })
                         Destination.Library -> LibraryScreen(bookDao, libraryDao, wishlistDao, activeLibraryId, activeLibrary?.name ?: "Personal Library", libraries.size, contentModifier, canModify, canManageWishlist, canDelete, { editedBook = null; editorVisible = true }, { editedBook = it; editorVisible = true }, { wishlistVisible = true }, { catalogVisible = true }, { libraryManagerVisible = true }, { libraryCreatorVisible = true })
-                        Destination.Search -> SearchScreen(bookDao, catalogDao, settings, activeLibraryId, activeLibrary?.name ?: "Personal Library", libraries.size, homeSearchQuery, contentModifier, canModify, canDelete, { editedBook = it; editorVisible = true })
-                        Destination.More -> MoreScreenImproved(database, bookDao, libraryDao, loanDao, wishlistDao, userDao, activeLibrary?.name.orEmpty(), activeLibraryId, signedInUser, contentModifier, canManageSettings, { settingsVisible = true })
-                        Destination.Loans -> LoansScreenImproved(bookDao, loanDao, activeLibraryId, activeLibrary?.name ?: "Personal Library", libraries.size, contentModifier, canManageLoans)
+                        Destination.Search -> SearchScreen(bookDao, catalogDao, libraryDao, settings, activeLibraryId, homeSearchQuery, contentModifier, canModify, canDelete, { editedBook = it; editorVisible = true })
+                        Destination.More -> MoreScreenImproved(database, bookDao, libraryDao, loanDao, wishlistDao, userDao, activeLibraryId, signedInUser, contentModifier, canManageSettings, { settingsVisible = true })
+                        Destination.Loans -> LoansScreenImproved(bookDao, loanDao, activeLibraryId, contentModifier, canManageLoans)
                     }
                 }
             }
@@ -1001,16 +1003,48 @@ private fun MoreActionCard(title: String, description: String, action: String, o
 }
 
 @Composable
-private fun LoansScreenImproved(bookDao: BookDao, loanDao: LoanDao, activeLibraryId: Long?, libraryName: String, libraryCount: Int, modifier: Modifier, canModify: Boolean) {
+private fun LoansScreenImproved(bookDao: BookDao, loanDao: LoanDao, activeLibraryId: Long?, modifier: Modifier, canModify: Boolean) {
+    val context = LocalContext.current
     val books by (activeLibraryId?.let { bookDao.observeForLibrary(it) } ?: flowOf(emptyList())).collectAsState(emptyList())
     val loans by (activeLibraryId?.let { loanDao.observeForLibrary(it) } ?: flowOf(emptyList())).collectAsState(emptyList())
     val scope = rememberCoroutineScope()
     var addVisible by rememberSaveable { mutableStateOf(false) }
     var editingLoan by remember { mutableStateOf<LoanEntity?>(null) }
-    var overdueOnly by rememberSaveable { mutableStateOf(false) }
+    var loanFilter by rememberSaveable { mutableStateOf("All") }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var sortOrder by rememberSaveable { mutableStateOf("Due date") }
+    var loanPage by rememberSaveable { mutableStateOf(0) }
+    val today = LocalDate.now()
     val availableBooks = books.filter { book -> loans.none { it.bookId == book.id && it.actualReturnDate == null } }
-    val overdueLoans = loans.filter { it.actualReturnDate == null && it.expectedReturnDate != null && it.expectedReturnDate < LocalDate.now().toString() }
-    val displayedLoans = if (overdueOnly) overdueLoans else loans
+    val overdueLoans = loans.filter { it.actualReturnDate == null && it.expectedReturnDate != null && it.expectedReturnDate < today.toString() }
+    val activeLoans = loans.filter { it.actualReturnDate == null }
+    val dueSoonLoans = activeLoans.filter { loan ->
+        loan.expectedReturnDate?.let { dueDate -> runCatching { LocalDate.parse(dueDate) }.getOrNull()?.let { !it.isBefore(today) && !it.isAfter(today.plusDays(7)) } } == true
+    }
+    val displayedLoans = loans.asSequence()
+        .filter { loan ->
+            when (loanFilter) {
+                "Active" -> loan.actualReturnDate == null
+                "Overdue" -> loan in overdueLoans
+                "Due soon" -> loan in dueSoonLoans
+                "Returned" -> loan.actualReturnDate != null
+                else -> true
+            }
+        }
+        .filter { loan ->
+            val book = books.firstOrNull { it.id == loan.bookId }
+            searchQuery.isBlank() || listOfNotNull(book?.title, book?.author, loan.borrowerName, loan.borrowerContact, loan.borrowedDate, loan.expectedReturnDate)
+                .any { it.contains(searchQuery, ignoreCase = true) }
+        }
+        .sortedWith(when (sortOrder) {
+            "Borrower" -> compareBy<LoanEntity> { it.borrowerName.lowercase() }
+            "Borrowed date" -> compareByDescending { it.borrowedDate }
+            "Newest" -> compareByDescending { it.createdAtMillis }
+            else -> compareBy<LoanEntity> { it.expectedReturnDate ?: "9999-12-31" }
+        })
+        .toList()
+    val loanPageCount = (displayedLoans.size + 9) / 10
+    val pageLoans = displayedLoans.drop(loanPage * 10).take(10)
     Column(modifier.fillMaxSize().padding(20.dp)) {
         ScreenHeader("Loans", "Keep every borrowed book in view") {
             if (canModify) IconButton(onClick = { addVisible = true }, enabled = availableBooks.isNotEmpty(), modifier = Modifier.size(48.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary)) {
@@ -1018,15 +1052,12 @@ private fun LoansScreenImproved(bookDao: BookDao, loanDao: LoanDao, activeLibrar
             }
         }
         Spacer(Modifier.height(16.dp))
-        MoreProfileCard(libraryName, books.size, libraryCount)
-        Spacer(Modifier.height(16.dp))
         Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = if (overdueLoans.isNotEmpty()) Color(0xFFFFE5E1) else MaterialTheme.colorScheme.secondaryContainer)) {
             Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(if (overdueLoans.isEmpty()) "Everything is on track" else "Action needed", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Text("${loans.count { it.actualReturnDate == null }} active loans  |  ${overdueLoans.size} overdue", style = MaterialTheme.typography.bodyMedium)
+                    Text("${activeLoans.size} active  |  ${overdueLoans.size} overdue  |  ${dueSoonLoans.size} due this week  |  ${loans.count { it.actualReturnDate != null }} returned", style = MaterialTheme.typography.bodyMedium)
                 }
-                TextButton(onClick = { overdueOnly = !overdueOnly }) { Text(if (overdueOnly) "All loans" else "Overdue") }
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -1034,9 +1065,36 @@ private fun LoansScreenImproved(bookDao: BookDao, loanDao: LoanDao, activeLibrar
             books.isEmpty() -> Text("Add a book before recording a loan.")
             availableBooks.isEmpty() -> Text("All ${books.size} books currently have active loans. Mark a book returned before recording another loan.")
         }
-        if (loans.isEmpty()) Text("No loan history yet.") else if (displayedLoans.isEmpty()) Text("No overdue books. All active loans are within their return dates.") else LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(displayedLoans, key = { it.id }) { loan ->
+        if (loans.isNotEmpty()) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("All", "Active", "Overdue").forEach { filter ->
+                    Button(onClick = { loanFilter = filter; loanPage = 0 }, modifier = Modifier.weight(1f), colors = if (loanFilter == filter) ButtonDefaults.buttonColors() else ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant)) { Text(filter, maxLines = 1) }
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("Due soon", "Returned").forEach { filter ->
+                    Button(onClick = { loanFilter = filter; loanPage = 0 }, modifier = Modifier.weight(1f), colors = if (loanFilter == filter) ButtonDefaults.buttonColors() else ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant)) { Text(filter, maxLines = 1) }
+                }
+                Spacer(Modifier.weight(1f))
+            }
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(searchQuery, { searchQuery = it; loanPage = 0 }, label = { Text("Search books, borrowers, or dates") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            ManagedCatalogDropdown("Sort by", sortOrder, listOf("Due date", "Borrowed date", "Borrower", "Newest")) { sortOrder = it; loanPage = 0 }
+            Spacer(Modifier.height(10.dp))
+        }
+        if (loans.isEmpty()) Text("No loan history yet.") else if (displayedLoans.isEmpty()) Text("No loans match the selected filter.") else LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(pageLoans, key = { it.id }) { loan ->
                 val book = books.firstOrNull { it.id == loan.bookId }
+                val dueDate = loan.expectedReturnDate?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+                val dueLabel = when {
+                    loan.actualReturnDate != null -> "Returned on ${loan.actualReturnDate}"
+                    dueDate == null -> "No due date"
+                    dueDate.isBefore(today) -> "${java.time.temporal.ChronoUnit.DAYS.between(dueDate, today)} days overdue"
+                    dueDate == today -> "Due today"
+                    dueDate == today.plusDays(1) -> "Due tomorrow"
+                    else -> "Due in ${java.time.temporal.ChronoUnit.DAYS.between(today, dueDate)} days"
+                }
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(14.dp)) {
                         Text(book?.title ?: "Deleted book", style = MaterialTheme.typography.titleMedium)
@@ -1044,9 +1102,20 @@ private fun LoansScreenImproved(bookDao: BookDao, loanDao: LoanDao, activeLibrar
                         if (!loan.borrowerContact.isNullOrBlank()) Text("Contact: ${loan.borrowerContact}")
                         Text("Borrowed: ${loan.borrowedDate}")
                         Text("Due: ${loan.expectedReturnDate ?: "Not set"}")
-                        Text(if (loan.actualReturnDate == null && loan.expectedReturnDate != null && loan.expectedReturnDate < LocalDate.now().toString()) "Overdue" else if (loan.actualReturnDate == null) "Lent" else "Returned on ${loan.actualReturnDate}")
-                        if (loan.actualReturnDate == null && canModify) Row { TextButton(onClick = { editingLoan = loan }) { Text("Edit") }; TextButton(onClick = { scope.launch { loanDao.markReturned(loan.id, LocalDate.now().toString()) } }) { Text("Mark returned") } }
+                        Text(dueLabel, color = if (dueDate?.isBefore(today) == true && loan.actualReturnDate == null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                        if (loan.actualReturnDate == null && canModify) Row {
+                            TextButton(onClick = { editingLoan = loan }) { Text("Edit") }
+                            TextButton(onClick = { scope.launch { loanDao.markReturned(loan.id, today.toString()) } }) { Text("Mark returned") }
+                            if (!loan.borrowerContact.isNullOrBlank()) TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(loan.borrowerContact)}"))) }) { Text("Contact") }
+                        }
                     }
+                }
+            }
+            if (loanPageCount > 1) item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = { loanPage -= 1 }, enabled = loanPage > 0) { Text("Previous") }
+                    Text("Page ${loanPage + 1} of $loanPageCount")
+                    TextButton(onClick = { loanPage += 1 }, enabled = loanPage < loanPageCount - 1) { Text("Next") }
                 }
             }
         }
@@ -1171,23 +1240,59 @@ private fun LoanEditorImproved(books: List<BookEntity>, loans: List<LoanEntity>,
 
 @Composable
 private fun BookPickerDialog(books: List<BookEntity>, selectedBookId: Long?, onSelect: (Long) -> Unit, onDismiss: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Select book") },
-        text = {
-            LazyColumn(Modifier.height(360.dp)) {
-                items(books, key = { it.id }) { book ->
-                    TextButton(onClick = { onSelect(book.id) }, modifier = Modifier.fillMaxWidth()) {
-                        Column(Modifier.fillMaxWidth()) {
-                            Text(if (book.id == selectedBookId) "Selected: ${book.title}" else book.title)
-                            Text(book.author, style = MaterialTheme.typography.bodySmall)
+    var query by rememberSaveable { mutableStateOf("") }
+    val selectedBook = books.firstOrNull { it.id == selectedBookId }
+    val matchingBooks = books.asSequence()
+        .filter { book ->
+            query.isBlank() || listOf(book.title, book.author, book.category.orEmpty())
+                .any { it.contains(query, ignoreCase = true) }
+        }
+        .sortedWith(compareBy<BookEntity> { it.title.lowercase() }.thenBy { it.author.lowercase() })
+        .toList()
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = MaterialTheme.shapes.extraLarge, modifier = Modifier.fillMaxSize().padding(12.dp)) {
+            Column(Modifier.padding(20.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Select book", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                        Text("Choose an available book for this loan", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    IconButton(onClick = onDismiss) { Icon(Icons.Outlined.Close, contentDescription = "Close book selection") }
+                }
+                Spacer(Modifier.height(16.dp))
+                Text("${books.size} available books", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (selectedBook != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(8.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("Selected", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                            Text(selectedBook.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                            Text(selectedBook.author, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(query, { query = it }, label = { Text("Search title, author, or category") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                if (matchingBooks.isEmpty()) Text("No available books match your search.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 16.dp))
+                else LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    items(matchingBooks, key = { it.id }) { book ->
+                        val isSelected = book.id == selectedBookId
+                        Card(modifier = Modifier.fillMaxWidth().clickable { onSelect(book.id) }, shape = RoundedCornerShape(8.dp), colors = CardDefaults.cardColors(containerColor = if (isSelected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceVariant)) {
+                            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(book.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    Text(book.author, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    book.category?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                }
+                                if (isSelected) Text("Selected", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                            }
                         }
                     }
                 }
             }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
-    )
+        }
+    }
 }
 
 @Composable
@@ -1245,15 +1350,24 @@ private fun BooksScreen(bookDao: BookDao, libraryDao: LibraryDao, modifier: Modi
     var authorFilter by rememberSaveable { mutableStateOf("") }
     var statusFilter by rememberSaveable { mutableStateOf("") }
     var favouritesOnly by rememberSaveable { mutableStateOf(false) }
+    var summaryFilter by rememberSaveable { mutableStateOf("Total") }
     var bookPendingDeletion by remember { mutableStateOf<BookEntity?>(null) }
     val listState = rememberLazyListState()
     val normalizedQuery = query.trim().lowercase()
+    val summaryBooks = allBooks.filter { book -> libraryFilter == 0L || book.libraryId == libraryFilter }
     val books = allBooks.asSequence()
         .filter { book -> libraryFilter == 0L || book.libraryId == libraryFilter }
         .filter { book -> categoryFilter.isBlank() || book.category.orEmpty().equals(categoryFilter, ignoreCase = true) }
         .filter { book -> authorFilter.isBlank() || book.author.equals(authorFilter, ignoreCase = true) }
         .filter { book -> statusFilter.isBlank() || book.readingStatus.equals(statusFilter, ignoreCase = true) }
         .filter { book -> !favouritesOnly || book.favourite }
+        .filter { book -> when (summaryFilter) {
+            "Read" -> book.readingStatus.equals("Read", true) || book.readingStatus.equals("Completed", true)
+            "Reading" -> book.readingStatus.equals("Reading", true)
+            "Unread" -> book.readingStatus.equals("Unread", true)
+            "Favourites" -> book.favourite
+            else -> true
+        } }
         .filter { book -> normalizedQuery.isBlank() || listOf(book.title, book.author, book.category.orEmpty(), book.publisher.orEmpty(), book.isbn.orEmpty()).any { value -> value.lowercase().contains(normalizedQuery) } }
         .let { results -> when (sort) {
             "Oldest Added" -> results.sortedBy { it.createdAtMillis }
@@ -1285,11 +1399,11 @@ private fun BooksScreen(bookDao: BookDao, libraryDao: LibraryDao, modifier: Modi
         OutlinedTextField(query, { query = it }, label = { Text("Search title, author, category, publisher, or ISBN") }, leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) }, singleLine = true, modifier = Modifier.fillMaxWidth())
         Spacer(Modifier.height(12.dp))
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            item { BooksSummaryChip("Total", allBooks.size) }
-            item { BooksSummaryChip("Read", allBooks.count { it.readingStatus.equals("Read", true) || it.readingStatus.equals("Completed", true) }) }
-            item { BooksSummaryChip("Reading", allBooks.count { it.readingStatus.equals("Reading", true) }) }
-            item { BooksSummaryChip("Unread", allBooks.count { it.readingStatus.equals("Unread", true) }) }
-            item { BooksSummaryChip("Favourites", allBooks.count { it.favourite }) }
+            item { BooksSummaryChip("Total", summaryBooks.size, summaryFilter == "Total") { summaryFilter = if (summaryFilter == "Total") "" else "Total" } }
+            item { BooksSummaryChip("Read", summaryBooks.count { it.readingStatus.equals("Read", true) || it.readingStatus.equals("Completed", true) }, summaryFilter == "Read") { summaryFilter = if (summaryFilter == "Read") "Total" else "Read" } }
+            item { BooksSummaryChip("Reading", summaryBooks.count { it.readingStatus.equals("Reading", true) }, summaryFilter == "Reading") { summaryFilter = if (summaryFilter == "Reading") "Total" else "Reading" } }
+            item { BooksSummaryChip("Unread", summaryBooks.count { it.readingStatus.equals("Unread", true) }, summaryFilter == "Unread") { summaryFilter = if (summaryFilter == "Unread") "Total" else "Unread" } }
+            item { BooksSummaryChip("Favourites", summaryBooks.count { it.favourite }, summaryFilter == "Favourites") { summaryFilter = if (summaryFilter == "Favourites") "Total" else "Favourites" } }
         }
         Spacer(Modifier.height(10.dp))
         Text("${books.size} ${if (books.size == 1) "book" else "books"} | $sort", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1307,8 +1421,12 @@ private fun BooksScreen(bookDao: BookDao, libraryDao: LibraryDao, modifier: Modi
 }
 
 @Composable
-private fun BooksSummaryChip(label: String, count: Int) {
-    Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.secondaryContainer) { Text("$label $count", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSecondaryContainer) }
+private fun BooksSummaryChip(label: String, count: Int, selected: Boolean, onClick: () -> Unit) {
+    val background = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer
+    val foreground = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer
+    Surface(modifier = Modifier.clickable(onClick = onClick), shape = RoundedCornerShape(16.dp), color = background) {
+        Text("$label $count", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp), style = MaterialTheme.typography.labelMedium, color = foreground)
+    }
 }
 
 @Composable
@@ -1589,35 +1707,49 @@ private fun WishlistItemEditor(item: WishlistEntity, onDismiss: () -> Unit, onSa
 }
 
 @Composable
-private fun SearchScreen(bookDao: BookDao, catalogDao: CatalogDao, settings: AppSettings, activeLibraryId: Long?, libraryName: String, libraryCount: Int, initialQuery: String, modifier: Modifier, canModify: Boolean, canDelete: Boolean, onEdit: (BookEntity) -> Unit) {
+private fun SearchScreen(bookDao: BookDao, catalogDao: CatalogDao, libraryDao: LibraryDao, settings: AppSettings, activeLibraryId: Long?, initialQuery: String, modifier: Modifier, canModify: Boolean, canDelete: Boolean, onEdit: (BookEntity) -> Unit) {
     var query by rememberSaveable { mutableStateOf("") }
     var category by rememberSaveable { mutableStateOf("") }
+    var author by rememberSaveable { mutableStateOf("") }
     var readingStatus by rememberSaveable { mutableStateOf("") }
     var tag by rememberSaveable { mutableStateOf("") }
     var collection by rememberSaveable { mutableStateOf("") }
     var favouritesOnly by rememberSaveable { mutableStateOf(false) }
-    var sort by rememberSaveable { mutableStateOf("Title") }
+    var sort by rememberSaveable { mutableStateOf("Recently Added") }
+    var libraryFilter by rememberSaveable { mutableStateOf(activeLibraryId ?: 0L) }
     var filtersVisible by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(initialQuery) { if (initialQuery.isNotBlank()) query = initialQuery }
-    val allBooks by (activeLibraryId?.let { bookDao.observeForLibrary(it) } ?: flowOf(emptyList())).collectAsState(emptyList())
+    val allBooks by bookDao.observeAll().collectAsState(emptyList())
+    val libraries by libraryDao.observeAll().collectAsState(emptyList())
+    val tags by catalogDao.observeTags().collectAsState(emptyList())
+    val collections by catalogDao.observeCollections().collectAsState(emptyList())
     val threshold by settings.fuzzyThreshold.collectAsState(70)
     val tagBookIds by (if (tag.isBlank()) flowOf(emptyList()) else catalogDao.observeBookIdsForTag(tag)).collectAsState(emptyList())
     val collectionBookIds by (if (collection.isBlank()) flowOf(emptyList()) else catalogDao.observeBookIdsForCollection(collection)).collectAsState(emptyList())
     val books = SearchRanking.rank(allBooks, query, threshold).asSequence()
-        .filter { category.isBlank() || it.category.orEmpty().contains(category, ignoreCase = true) }
-        .filter { readingStatus.isBlank() || it.readingStatus.contains(readingStatus, ignoreCase = true) }
+        .filter { libraryFilter == 0L || it.libraryId == libraryFilter }
+        .filter { category.isBlank() || it.category.orEmpty().equals(category, ignoreCase = true) }
+        .filter { author.isBlank() || it.author.equals(author, ignoreCase = true) }
+        .filter { readingStatus.isBlank() || it.readingStatus.equals(readingStatus, ignoreCase = true) }
         .filter { tag.isBlank() || it.id in tagBookIds }
         .filter { collection.isBlank() || it.id in collectionBookIds }
         .filter { !favouritesOnly || it.favourite }
-        .let { results -> when (sort) { "Author" -> results.sortedBy { it.author.lowercase() }; "Newest" -> results.sortedByDescending { it.createdAtMillis }; "Rating" -> results.sortedByDescending { it.rating ?: 0 }; "Price" -> results.sortedBy { it.pricePaise }; else -> results.sortedBy { it.title.lowercase() } } }
+        .let { results -> when (sort) {
+            "Oldest Added" -> results.sortedBy { it.createdAtMillis }
+            "Title A-Z" -> results.sortedBy { it.title.lowercase() }
+            "Title Z-A" -> results.sortedByDescending { it.title.lowercase() }
+            "Author Name" -> results.sortedBy { it.author.lowercase() }
+            "Purchase Date" -> results.sortedByDescending { it.purchaseDate.orEmpty() }
+            "Rating" -> results.sortedByDescending { it.rating ?: 0 }
+            "Price" -> results.sortedByDescending { it.pricePaise }
+            else -> results.sortedByDescending { it.createdAtMillis }
+        } }
         .toList()
     Column(modifier.fillMaxSize().padding(20.dp)) {
         ScreenHeader("Search", "Find the next book on your shelf") {
             TextButton(onClick = { filtersVisible = true }) { Text("Filters") }
         }
         Spacer(Modifier.height(16.dp))
-        MoreProfileCard(libraryName, allBooks.size, libraryCount)
-        Spacer(Modifier.height(14.dp))
         Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
             Column(Modifier.padding(12.dp)) {
                 OutlinedTextField(query, { query = it }, label = { Text("Search title, author, ISBN, or category") }, modifier = Modifier.fillMaxWidth(), singleLine = true, leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) })
@@ -1627,11 +1759,20 @@ private fun SearchScreen(bookDao: BookDao, catalogDao: CatalogDao, settings: App
         Spacer(Modifier.height(16.dp))
         if (books.isEmpty()) EmptyContentState("No books found", "Try another title or adjust your filters.") else BookList(books, bookDao, onEdit, canModify, canDelete, Modifier.weight(1f))
     }
-    if (filtersVisible) AlertDialog(onDismissRequest = { filtersVisible = false }, title = { Text("Search filters") }, text = { Column(Modifier.verticalScroll(rememberScrollState())) { OutlinedTextField(category, { category = it }, label = { Text("Filter category") }, modifier = Modifier.fillMaxWidth()); OutlinedTextField(readingStatus, { readingStatus = it }, label = { Text("Filter reading status") }, modifier = Modifier.fillMaxWidth()); OutlinedTextField(tag, { tag = it }, label = { Text("Filter tag (exact name)") }, modifier = Modifier.fillMaxWidth()); OutlinedTextField(collection, { collection = it }, label = { Text("Filter collection (exact name)") }, modifier = Modifier.fillMaxWidth()); Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(favouritesOnly, { favouritesOnly = it }); Text("Favourites only") }; OutlinedTextField(sort, { sort = it }, label = { Text("Sort: Title, Author, Newest, Rating, Price") }, modifier = Modifier.fillMaxWidth()) } }, confirmButton = { TextButton(onClick = { filtersVisible = false }) { Text("Apply") } }, dismissButton = { TextButton(onClick = { category = ""; readingStatus = ""; tag = ""; collection = ""; favouritesOnly = false; sort = "Title" }) { Text("Clear") } })
+    if (filtersVisible) AlertDialog(onDismissRequest = { filtersVisible = false }, title = { Text("Sort and filter") }, text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        ManagedCatalogDropdown("Sort", sort, listOf("Recently Added", "Oldest Added", "Title A-Z", "Title Z-A", "Author Name", "Purchase Date", "Rating", "Price")) { sort = it }
+        ManagedCatalogDropdown("Library", libraries.firstOrNull { it.id == libraryFilter }?.name.orEmpty(), listOf("All libraries") + libraries.map { it.name }) { selected -> libraryFilter = libraries.firstOrNull { it.name == selected }?.id ?: 0L }
+        ManagedCatalogDropdown("Category", category, allBooks.mapNotNull { it.category }.distinct().sorted()) { category = it }
+        ManagedCatalogDropdown("Author", author, allBooks.map { it.author }.distinct().sorted()) { author = it }
+        ManagedCatalogDropdown("Reading status", readingStatus, listOf("Unread", "Reading", "Completed")) { readingStatus = it }
+        ManagedCatalogDropdown("Tag", tag, tags.map { it.name }.sorted()) { tag = it }
+        ManagedCatalogDropdown("Collection", collection, collections.map { it.name }.sorted()) { collection = it }
+        Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(favouritesOnly, { favouritesOnly = it }); Text("Favourite books only") }
+    } }, confirmButton = { TextButton(onClick = { filtersVisible = false }) { Text("Apply") } }, dismissButton = { TextButton(onClick = { libraryFilter = activeLibraryId ?: 0L; category = ""; author = ""; readingStatus = ""; tag = ""; collection = ""; favouritesOnly = false; sort = "Recently Added" }) { Text("Clear") } })
 }
 
 @Composable
-private fun MoreScreenImproved(database: LibraryDatabase, bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishlistDao: WishlistDao, userDao: UserDao, libraryName: String, activeLibraryId: Long?, signedInUser: UserEntity?, modifier: Modifier, canModify: Boolean, onSettings: () -> Unit) {
+private fun MoreScreenImproved(database: LibraryDatabase, bookDao: BookDao, libraryDao: LibraryDao, loanDao: LoanDao, wishlistDao: WishlistDao, userDao: UserDao, activeLibraryId: Long?, signedInUser: UserEntity?, modifier: Modifier, canModify: Boolean, onSettings: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val accessRepository = remember(database) { LibraryAccessRepository(database) }
@@ -1648,6 +1789,7 @@ private fun MoreScreenImproved(database: LibraryDatabase, bookDao: BookDao, libr
     val users by userDao.observeAll().collectAsState(emptyList())
     val loans by loanDao.observeAll().collectAsState(emptyList())
     val wishlist by wishlistDao.observeAll().collectAsState(emptyList())
+    val canViewReports = signedInUser?.userRole?.can(com.venkateshgowda.personallibrary.data.LibraryPermission.ViewReports) == true
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) scope.launch { message = try { "Imported ${LegacyImportService(context, database).importArchive(uri)} books." } catch (error: Exception) { error.message ?: "Could not import archive." } } }
     val csvLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri -> if (uri != null && csvPayload != null) { context.contentResolver.openOutputStream(uri)?.use { it.write(csvPayload) }; message = "CSV export saved." } }
     val xlsxLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) { uri -> if (uri != null && xlsxPayload != null) { context.contentResolver.openOutputStream(uri)?.use { it.write(xlsxPayload) }; message = "XLSX export saved." } }
@@ -1655,24 +1797,12 @@ private fun MoreScreenImproved(database: LibraryDatabase, bookDao: BookDao, libr
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
         ScreenHeader("More", "Your library command centre") {}
         Spacer(Modifier.height(16.dp))
-        MoreProfileCard(libraryName.ifBlank { "Personal Library" }, books.size, libraries.size)
-        Spacer(Modifier.height(22.dp))
-        Text("Quick insights", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(10.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            MoreInsight("Books", books.size.toString(), Icons.Outlined.LocalLibrary, MaterialTheme.colorScheme.primaryContainer, Modifier.weight(1f))
-            MoreInsight("Authors", books.map { it.author.trim().lowercase() }.filter { it.isNotEmpty() }.distinct().size.toString(), Icons.Outlined.People, MaterialTheme.colorScheme.secondaryContainer, Modifier.weight(1f))
-        }
-        Spacer(Modifier.height(10.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            MoreInsight("Categories", books.map { it.category?.trim().orEmpty() }.filter { it.isNotEmpty() }.distinct().size.toString(), Icons.Outlined.Bookmark, MaterialTheme.colorScheme.tertiaryContainer, Modifier.weight(1f))
-            MoreInsight("Users", users.size.toString(), Icons.Outlined.People, MaterialTheme.colorScheme.surfaceVariant, Modifier.weight(1f))
-        }
-        Spacer(Modifier.height(22.dp))
         Text("Management", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(10.dp))
-        ManagementCard("Reports", "View reading trends and book statistics", Icons.Outlined.Assessment, { ReportPreviewChips() }) { reportsVisible = true }
-        Spacer(Modifier.height(10.dp))
+        if (canViewReports) {
+            ManagementCard("Reports", "View reading trends and book statistics", Icons.Outlined.Assessment, { ReportPreviewChips() }) { reportsVisible = true }
+            Spacer(Modifier.height(10.dp))
+        }
         if (canModify) ManagementCard("Settings", "Configure preferences, privacy, and backups", Icons.Outlined.Settings) { onSettings() }
         if (signedInUser?.userRole?.can(com.venkateshgowda.personallibrary.data.LibraryPermission.ManageUsers) == true) {
             Spacer(Modifier.height(10.dp))
@@ -1703,13 +1833,13 @@ private fun MoreScreenImproved(database: LibraryDatabase, bookDao: BookDao, libr
         }
         if (message != null) Text(message!!, modifier = Modifier.padding(top = 16.dp), color = MaterialTheme.colorScheme.error)
     }
-    if (reportsVisible) ReportsDashboardDialog(
-        books, libraries, loans, wishlist,
+    if (reportsVisible && canViewReports) ReportsDashboardDialog(
+        books, libraries, users, loans, wishlist,
         onDismiss = { reportsVisible = false },
-        onExportExcel = { xlsxPayload = ReportExportService.workbook(books, wishlist, loans, LocalDate.now().toString()); xlsxLauncher.launch("library-report.xlsx") },
-        onExportPdf = { pdfPayload = createReportPdf(books, libraries, loans); pdfLauncher.launch("library-report.pdf") },
-        onShare = {
-            context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, reportShareText(books, libraries, loans)), "Share library report"))
+        onExportExcel = { filteredBooks, filteredLoans, filteredWishlist -> xlsxPayload = ReportExportService.workbook(filteredBooks, filteredWishlist, filteredLoans, LocalDate.now().toString()); xlsxLauncher.launch("library-report.xlsx") },
+        onExportPdf = { filteredBooks, filteredLoans -> pdfPayload = createReportPdf(filteredBooks, libraries, filteredLoans); pdfLauncher.launch("library-report.pdf") },
+        onShare = { filteredBooks, filteredLoans ->
+            context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, reportShareText(filteredBooks, libraries, filteredLoans)), "Share library report"))
         }
     )
     if (aboutVisible) AboutAppDialog(onDismiss = { aboutVisible = false })
@@ -1864,29 +1994,151 @@ private fun ReportsDialog(report: com.venkateshgowda.personallibrary.data.Report
 }
 
 @Composable
-private fun ReportsDashboardDialog(books: List<BookEntity>, libraries: List<LibraryEntity>, loans: List<LoanEntity>, wishlist: List<WishlistEntity>, onDismiss: () -> Unit, onExportExcel: () -> Unit, onExportPdf: () -> Unit, onShare: () -> Unit) {
+private fun ReportsDashboardDialog(allBooks: List<BookEntity>, libraries: List<LibraryEntity>, users: List<UserEntity>, loans: List<LoanEntity>, wishlist: List<WishlistEntity>, onDismiss: () -> Unit, onExportExcel: (List<BookEntity>, List<LoanEntity>, List<WishlistEntity>) -> Unit, onExportPdf: (List<BookEntity>, List<LoanEntity>) -> Unit, onShare: (List<BookEntity>, List<LoanEntity>) -> Unit) {
     val today = LocalDate.now()
-    val completed = books.filter { it.readingStatus.equals("Read", true) || it.readingStatus.equals("Completed", true) }
-    val reading = books.count { it.readingStatus.equals("Reading", true) || it.readingStatus.equals("In progress", true) }
-    val unread = books.count { it.readingStatus.equals("Unread", true) }
-    val categories = reportCount(books) { it.category ?: "Uncategorized" }
-    val authors = reportCount(books) { it.author }
-    val publishers = reportCount(books) { it.publisher ?: "Unknown publisher" }
-    val languages = reportCount(books) { it.language ?: "Unspecified" }
-    val statuses = reportCount(books) { it.readingStatus }
-    val libraryNames = reportCount(books) { book -> libraries.firstOrNull { it.id == book.libraryId }?.name ?: "Unknown library" }
-    val spendingByCategory = reportAmount(books) { it.category ?: "Uncategorized" }
-    val spendingByMonth = reportAmount(books.filter { !it.purchaseDate.isNullOrBlank() }) { it.purchaseDate!!.take(7) }
-    val spendingByYear = reportAmount(books.filter { !it.purchaseDate.isNullOrBlank() }) { it.purchaseDate!!.take(4) }
-    val addedThisWeek = books.count { it.createdAtMillis >= today.minusDays(7).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
-    val addedThisMonth = books.count { it.createdAtMillis >= today.withDayOfMonth(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
-    val addedThisYear = books.count { it.createdAtMillis >= today.withDayOfYear(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
-    val readThisMonth = completed.count { it.updatedAtMillis >= today.withDayOfMonth(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
-    val readThisYear = completed.count { it.updatedAtMillis >= today.withDayOfYear(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() }
-    val averageRating = books.mapNotNull { it.rating }.average().takeIf { !it.isNaN() }
-    val activeLoans = loans.filter { it.actualReturnDate == null }
+    var libraryFilter by rememberSaveable { mutableStateOf(0L) }
+    var categoryFilter by rememberSaveable { mutableStateOf("") }
+    var authorFilter by rememberSaveable { mutableStateOf("") }
+    var languageFilter by rememberSaveable { mutableStateOf("") }
+    var publisherFilter by rememberSaveable { mutableStateOf("") }
+    var statusFilter by rememberSaveable { mutableStateOf("") }
+    var ratingFilter by rememberSaveable { mutableStateOf("") }
+    var loanStatusFilter by rememberSaveable { mutableStateOf("") }
+    var wishlistStatusFilter by rememberSaveable { mutableStateOf("") }
+    var dateRange by rememberSaveable { mutableStateOf("All time") }
+    var minimumPrice by rememberSaveable { mutableStateOf("") }
+    var maximumPrice by rememberSaveable { mutableStateOf("") }
+    var reportType by rememberSaveable { mutableStateOf("All Books") }
+    var reportGenerated by rememberSaveable { mutableStateOf(false) }
+    var filtersVisible by rememberSaveable { mutableStateOf(false) }
+    var resultsView by rememberSaveable { mutableStateOf("List") }
+    var resultQuery by rememberSaveable { mutableStateOf("") }
+    var resultPage by rememberSaveable { mutableStateOf(0) }
+    val startDateMillis = when (dateRange) {
+        "Last 7 days" -> today.minusDays(7)
+        "Last 30 days" -> today.minusDays(30)
+        "This year" -> today.withDayOfYear(1)
+        else -> null
+    }?.atStartOfDay(java.time.ZoneId.systemDefault())?.toInstant()?.toEpochMilli()
+    val books = allBooks.asSequence()
+        .filter { libraryFilter == 0L || it.libraryId == libraryFilter }
+        .filter { categoryFilter.isBlank() || it.category.orEmpty().equals(categoryFilter, ignoreCase = true) }
+        .filter { authorFilter.isBlank() || it.author.equals(authorFilter, ignoreCase = true) }
+        .filter { languageFilter.isBlank() || it.language.orEmpty().equals(languageFilter, ignoreCase = true) }
+        .filter { publisherFilter.isBlank() || it.publisher.orEmpty().equals(publisherFilter, ignoreCase = true) }
+        .filter { statusFilter.isBlank() || it.readingStatus.equals(statusFilter, ignoreCase = true) }
+        .filter { ratingFilter.isBlank() || it.rating?.toString() == ratingFilter }
+        .filter { startDateMillis == null || it.createdAtMillis >= startDateMillis }
+        .filter { minimumPrice.toLongOrNull()?.let { minimum -> it.pricePaise >= minimum * 100 } ?: true }
+        .filter { maximumPrice.toLongOrNull()?.let { maximum -> it.pricePaise <= maximum * 100 } ?: true }
+        .toList()
+    val filteredBookIds = books.map { it.id }.toSet()
+    val filteredLoans = loans.filter { loan ->
+        loan.bookId in filteredBookIds && when (loanStatusFilter) {
+            "Active" -> loan.actualReturnDate == null
+            "Returned" -> loan.actualReturnDate != null
+            "Overdue" -> loan.actualReturnDate == null && !loan.expectedReturnDate.isNullOrBlank() && loan.expectedReturnDate < today.toString()
+            else -> true
+        }
+    }
+    val filteredWishlist = wishlist.filter { item ->
+        (libraryFilter == 0L || item.libraryId == libraryFilter) &&
+            (wishlistStatusFilter.isBlank() || item.status.equals(wishlistStatusFilter, ignoreCase = true))
+    }
+    val activeLoans = filteredLoans.filter { it.actualReturnDate == null }
     val overdue = activeLoans.filter { !it.expectedReturnDate.isNullOrBlank() && it.expectedReturnDate < today.toString() }
-    val borrowers = reportLoanCount(activeLoans) { it.borrowerName }
+    val reportLoans = when (reportType) {
+        "Loaned Books" -> filteredLoans.filter { it.actualReturnDate == null }
+        "Returned Books" -> filteredLoans.filter { it.actualReturnDate != null }
+        "Overdue Books" -> overdue
+        "Loan History" -> filteredLoans
+        else -> filteredLoans
+    }
+    val reportWishlist = if (reportType == "Wishlist Books" || reportType == "Wishlist by Library") filteredWishlist else emptyList()
+    val libraryBookCounts = libraries
+        .filter { libraryFilter == 0L || it.id == libraryFilter }
+        .map { library -> library to books.count { it.libraryId == library.id } }
+        .filter { resultQuery.isBlank() || it.first.name.contains(resultQuery, ignoreCase = true) }
+        .sortedWith(compareByDescending<Pair<LibraryEntity, Int>> { it.second }.thenBy { it.first.name.lowercase() })
+    val wishlistByLibrary = libraries
+        .asSequence()
+        .filter { libraryFilter == 0L || it.id == libraryFilter }
+        .map { library ->
+            val libraryWishlist = filteredWishlist.filter { it.libraryId == library.id }
+            Triple(library, libraryWishlist.size, libraryWishlist.sumOf { it.expectedPricePaise })
+        }
+        .filter { resultQuery.isBlank() || it.first.name.contains(resultQuery, ignoreCase = true) }
+        .sortedWith(compareByDescending<Triple<LibraryEntity, Int, Long>> { it.second }.thenBy { it.first.name.lowercase() })
+        .toList()
+    val loanFilteredBooks = if (loanStatusFilter.isBlank()) books else books.filter { book -> filteredLoans.any { it.bookId == book.id } }
+    val authorBookCounts = loanFilteredBooks
+        .groupBy { it.author.trim().ifBlank { "Unknown author" } }
+        .map { (author, authorBooks) -> Triple(author, authorBooks.size, authorBooks.sumOf { it.pricePaise }) }
+        .filter { resultQuery.isBlank() || it.first.contains(resultQuery, ignoreCase = true) }
+        .sortedWith(compareByDescending<Triple<String, Int, Long>> { it.second }.thenBy { it.first.lowercase() })
+    val categoryBookCounts = loanFilteredBooks
+        .groupBy { it.category?.trim().orEmpty().ifBlank { "Uncategorized" } }
+        .map { (category, categoryBooks) -> Triple(category, categoryBooks.size, categoryBooks.sumOf { it.pricePaise }) }
+        .filter { resultQuery.isBlank() || it.first.contains(resultQuery, ignoreCase = true) }
+        .sortedWith(compareByDescending<Triple<String, Int, Long>> { it.second }.thenBy { it.first.lowercase() })
+    val languageBookCounts = loanFilteredBooks
+        .groupBy { it.language?.trim().orEmpty().ifBlank { "Unspecified" } }
+        .map { (language, languageBooks) -> Triple(language, languageBooks.size, languageBooks.sumOf { it.pricePaise }) }
+        .filter { resultQuery.isBlank() || it.first.contains(resultQuery, ignoreCase = true) }
+        .sortedWith(compareByDescending<Triple<String, Int, Long>> { it.second }.thenBy { it.first.lowercase() })
+    val publisherBookCounts = loanFilteredBooks
+        .groupBy { it.publisher?.trim().orEmpty().ifBlank { "Unknown publisher" } }
+        .map { (publisher, publisherBooks) -> Triple(publisher, publisherBooks.size, publisherBooks.sumOf { it.pricePaise }) }
+        .filter { resultQuery.isBlank() || it.first.contains(resultQuery, ignoreCase = true) }
+        .sortedWith(compareByDescending<Triple<String, Int, Long>> { it.second }.thenBy { it.first.lowercase() })
+    val ratingBookCounts = loanFilteredBooks
+        .groupBy { it.rating?.let { rating -> "$rating stars" } ?: "Unrated" }
+        .map { (rating, ratingBooks) -> Triple(rating, ratingBooks.size, ratingBooks.sumOf { it.pricePaise }) }
+        .filter { resultQuery.isBlank() || it.first.contains(resultQuery, ignoreCase = true) }
+        .sortedWith(compareByDescending<Triple<String, Int, Long>> { it.first.removeSuffix(" stars").toIntOrNull() ?: 0 }
+            .thenBy { it.first })
+    val readingStatusBookCounts = loanFilteredBooks
+        .groupBy { it.readingStatus.trim().ifBlank { "Unspecified" } }
+        .map { (status, statusBooks) -> Triple(status, statusBooks.size, statusBooks.sumOf { it.pricePaise }) }
+        .filter { resultQuery.isBlank() || it.first.contains(resultQuery, ignoreCase = true) }
+        .sortedWith(compareByDescending<Triple<String, Int, Long>> { it.second }.thenBy { it.first.lowercase() })
+    val spendingByCategory = loanFilteredBooks
+        .groupBy { it.category?.trim().orEmpty().ifBlank { "Uncategorized" } }
+        .map { (category, categoryBooks) -> Triple(category, categoryBooks.size, categoryBooks.sumOf { it.pricePaise }) }
+        .filter { resultQuery.isBlank() || it.first.contains(resultQuery, ignoreCase = true) }
+        .sortedWith(compareByDescending<Triple<String, Int, Long>> { it.third }.thenBy { it.first.lowercase() })
+    val recentlyAddedStart = today.minusDays(30).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+    val recentlyCreatedLibraries = libraries
+        .asSequence()
+        .filter { libraryFilter == 0L || it.id == libraryFilter }
+        .filter { it.createdAtMillis >= recentlyAddedStart }
+        .filter { resultQuery.isBlank() || it.name.contains(resultQuery, ignoreCase = true) }
+        .sortedByDescending { it.createdAtMillis }
+        .toList()
+    val purchasedBooks = loanFilteredBooks
+        .filter { !it.purchaseDate.isNullOrBlank() }
+        .sortedByDescending { it.purchaseDate }
+    val monthlyPurchases = purchasedBooks
+        .groupBy { it.purchaseDate!!.take(7) }
+        .map { (period, periodBooks) -> Triple(period, periodBooks.size, periodBooks.sumOf { it.pricePaise }) }
+        .filter { resultQuery.isBlank() || it.first.contains(resultQuery, ignoreCase = true) }
+        .sortedByDescending { it.first }
+    val yearlyPurchases = purchasedBooks
+        .groupBy { it.purchaseDate!!.take(4) }
+        .map { (period, periodBooks) -> Triple(period, periodBooks.size, periodBooks.sumOf { it.pricePaise }) }
+        .filter { resultQuery.isBlank() || it.first.contains(resultQuery, ignoreCase = true) }
+        .sortedByDescending { it.first }
+    val reportBooks = when (reportType) {
+        "Loaned Books", "Returned Books", "Overdue Books", "Loan History" -> loanFilteredBooks.filter { book -> reportLoans.any { it.bookId == book.id } }
+        "Recently Added Books" -> loanFilteredBooks.filter { it.createdAtMillis >= recentlyAddedStart }.sortedByDescending { it.createdAtMillis }
+        "My Library Books" -> if (libraryFilter == 0L) emptyList() else loanFilteredBooks
+        "Books by Reading Status" -> loanFilteredBooks.sortedBy { it.readingStatus }
+        "Books by Rating" -> loanFilteredBooks.sortedByDescending { it.rating ?: 0 }
+        "All Purchases", "Monthly Purchase Report", "Yearly Purchase Report" -> purchasedBooks
+        else -> loanFilteredBooks
+    }.filter { book -> resultQuery.isBlank() || listOf(book.title, book.author, book.category.orEmpty(), book.publisher.orEmpty()).any { it.contains(resultQuery, ignoreCase = true) } }
+    val totalPages = (reportBooks.size + 9) / 10
+    val pageBooks = reportBooks.drop(resultPage * 10).take(10)
     Dialog(onDismissRequest = onDismiss) {
         Surface(shape = MaterialTheme.shapes.extraLarge, modifier = Modifier.fillMaxSize().padding(12.dp)) {
             Column(Modifier.padding(20.dp)) {
@@ -1895,16 +2147,136 @@ private fun ReportsDashboardDialog(books: List<BookEntity>, libraries: List<Libr
                     IconButton(onClick = onDismiss) { Icon(Icons.Outlined.MoreHoriz, contentDescription = "Close reports") }
                 }
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.weight(1f)) {
-                    item { ReportMetricGrid(listOf("Total books" to books.size.toString(), "Authors" to authors.size.toString(), "Categories" to categories.size.toString(), "Favourites" to books.count { it.favourite }.toString(), "Reading" to reading.toString(), "Completed" to completed.size.toString(), "Unread" to unread.toString(), "Libraries" to libraries.size.toString())) }
-                    item { ReportSection("Reading analytics") { ReportInsight("Progress", "${completed.size} of ${books.size} completed (${if (books.isEmpty()) 0 else completed.size * 100 / books.size}%)"); ReportInsight("Books read", "$readThisMonth this month | $readThisYear this year"); ReportInsight("Average rating", averageRating?.let { "%.1f / 5".format(it) } ?: "No ratings yet"); ReportBarChart("Reading status", statuses); ReportBookList("Top rated books", books.filter { it.rating != null }.sortedByDescending { it.rating }.take(5)) } }
-                    item { ReportSection("Collection reports") { ReportBarChart("Books by category", categories); ReportBarChart("Books by author", authors); ReportBarChart("Books by publisher", publishers); ReportBarChart("Books by library", libraryNames); ReportBarChart("Books by language", languages) } }
-                    item { ReportSection("Financial reports") { ReportInsight("Total investment", formatInr(books.sumOf { it.pricePaise })); ReportInsight("Average book price", if (books.isEmpty()) formatInr(0) else formatInr(books.sumOf { it.pricePaise } / books.size)); ReportBarChart("Spending by month", spendingByMonth, true); ReportBarChart("Spending by year", spendingByYear, true); ReportBarChart("Spending by category", spendingByCategory, true); ReportBookList("Most expensive books", books.sortedByDescending { it.pricePaise }.take(5), true) } }
-                    item { ReportSection("Library growth") { ReportInsight("Books added", "$addedThisWeek this week | $addedThisMonth this month | $addedThisYear this year"); ReportBarChart("Collection growth trend", reportCount(books) { java.time.Instant.ofEpochMilli(it.createdAtMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate().toString().take(7) }); ReportBookList("Recently added", books.sortedByDescending { it.createdAtMillis }.take(5)) } }
-                    item { ReportSection("Author insights") { ReportBarChart("Authors with most books", authors); ReportInsight("Favourite author", books.filter { it.favourite }.groupingBy { it.author }.eachCount().maxByOrNull { it.value }?.key ?: "No favourites yet") } }
-                    item { ReportSection("Borrowing reports") { ReportInsight("Lent books", activeLoans.size.toString()); ReportInsight("Overdue books", overdue.size.toString()); ReportBarChart("Most active borrowers", borrowers) } }
-                    item { ReportSection("Reading insights") { ReportInsight("Collection focus", categories.firstOrNull()?.let { "${it.label} books make up ${if (books.isEmpty()) 0 else it.value * 100 / books.size}% of your collection." } ?: "Add books to discover patterns."); ReportInsight("Unread investment", "You have $unread unread books worth ${formatInr(books.filter { it.readingStatus.equals("Unread", true) }.sumOf { it.pricePaise })}."); ReportInsight("Wishlist", "${wishlist.size} books are planned for your collection.") } }
+                    item { ReportSection("Quick reports") {
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(listOf("All Books", "Loaned Books", "Wishlist Books", "My Library Books")) { quickReport ->
+                                Button(onClick = { reportType = quickReport; reportGenerated = true; resultPage = 0 }, enabled = reportType != quickReport) { Text(quickReport) }
+                            }
+                        }
+                    } }
+                    item { ReportSection("Report generator") {
+                        ManagedCatalogDropdown("Report category", reportType, listOf("All Books", "Books by Library", "Books by Category", "Books by Language", "Books by Author", "Books by Publisher", "Books by Rating", "Books by Reading Status", "Recently Added Books", "All Libraries", "Library-wise Book Count", "Recently Created Libraries", "All Users", "Loaned Books", "Returned Books", "Overdue Books", "Loan History", "Wishlist Books", "Wishlist by Library", "All Purchases", "Monthly Purchase Report", "Yearly Purchase Report", "Spending by Category")) { reportType = it; reportGenerated = false; resultPage = 0 }
+                        TextButton(onClick = { filtersVisible = !filtersVisible }) { Text(if (filtersVisible) "Hide custom filters" else "Custom report builder") }
+                    } }
+                    if (filtersVisible) item { ReportSection("Custom filters") {
+                        ManagedCatalogDropdown("Library", libraries.firstOrNull { it.id == libraryFilter }?.name.orEmpty(), listOf("All libraries") + libraries.map { it.name }) { selected -> libraryFilter = libraries.firstOrNull { it.name == selected }?.id ?: 0L }
+                        ManagedCatalogDropdown("Category", categoryFilter, allBooks.mapNotNull { it.category }.distinct().sorted()) { categoryFilter = it }
+                        ManagedCatalogDropdown("Author", authorFilter, allBooks.map { it.author }.distinct().sorted()) { authorFilter = it }
+                        ManagedCatalogDropdown("Language", languageFilter, allBooks.mapNotNull { it.language }.distinct().sorted()) { languageFilter = it }
+                        ManagedCatalogDropdown("Publisher", publisherFilter, allBooks.mapNotNull { it.publisher }.distinct().sorted()) { publisherFilter = it }
+                        ManagedCatalogDropdown("Reading status", statusFilter, listOf("Unread", "Reading", "Completed")) { statusFilter = it }
+                        ManagedCatalogDropdown("Rating", ratingFilter, (1..5).map { it.toString() }) { ratingFilter = it }
+                        ManagedCatalogDropdown("Loan status", loanStatusFilter, listOf("Active", "Returned", "Overdue")) { loanStatusFilter = it }
+                        ManagedCatalogDropdown("Wishlist status", wishlistStatusFilter, wishlist.map { it.status }.distinct().sorted()) { wishlistStatusFilter = it }
+                        ManagedCatalogDropdown("Added", dateRange, listOf("All time", "Last 7 days", "Last 30 days", "This year")) { dateRange = it.ifBlank { "All time" } }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(minimumPrice, { minimumPrice = it.filter(Char::isDigit) }, label = { Text("Min INR") }, singleLine = true, modifier = Modifier.weight(1f))
+                            OutlinedTextField(maximumPrice, { maximumPrice = it.filter(Char::isDigit) }, label = { Text("Max INR") }, singleLine = true, modifier = Modifier.weight(1f))
+                        }
+                        TextButton(onClick = { libraryFilter = 0L; categoryFilter = ""; authorFilter = ""; languageFilter = ""; publisherFilter = ""; statusFilter = ""; ratingFilter = ""; loanStatusFilter = ""; wishlistStatusFilter = ""; dateRange = "All time"; minimumPrice = ""; maximumPrice = "" }) { Text("Clear filters") }
+                    } }
+                    item { Button(onClick = { reportGenerated = true; resultPage = 0 }, modifier = Modifier.fillMaxWidth()) { Text("Generate report") } }
+                    if (reportGenerated) item { ReportSection(reportType) {
+                        ReportMetricGrid(listOf("Records" to when (reportType) { "Books by Library", "Library-wise Book Count" -> libraryBookCounts.size.toString(); "Books by Author" -> authorBookCounts.size.toString(); "Books by Category" -> categoryBookCounts.size.toString(); "Books by Language" -> languageBookCounts.size.toString(); "Books by Publisher" -> publisherBookCounts.size.toString(); "Books by Rating" -> ratingBookCounts.size.toString(); "Books by Reading Status" -> readingStatusBookCounts.size.toString(); "Recently Created Libraries" -> recentlyCreatedLibraries.size.toString(); "Monthly Purchase Report" -> monthlyPurchases.size.toString(); "Yearly Purchase Report" -> yearlyPurchases.size.toString(); "Wishlist by Library" -> wishlistByLibrary.size.toString(); "Wishlist Books" -> reportWishlist.size.toString(); "Spending by Category" -> spendingByCategory.size.toString(); "All Users" -> users.size.toString(); "Loaned Books", "Returned Books", "Overdue Books", "Loan History" -> reportLoans.size.toString(); else -> reportBooks.size.toString() }, "Investment" to formatInr(reportBooks.sumOf { it.pricePaise }), "Active loans" to activeLoans.size.toString(), "Overdue" to overdue.size.toString()))
+                        Text("Applied filters: ${listOfNotNull(libraries.firstOrNull { it.id == libraryFilter }?.name, categoryFilter.ifBlank { null }, authorFilter.ifBlank { null }, languageFilter.ifBlank { null }, publisherFilter.ifBlank { null }, statusFilter.ifBlank { null }, ratingFilter.takeIf { it.isNotBlank() }?.let { "$it stars" }, loanStatusFilter.ifBlank { null }, wishlistStatusFilter.ifBlank { null }, dateRange.takeUnless { it == "All time" }, minimumPrice.takeIf { it.isNotBlank() }?.let { "Min INR $it" }, maximumPrice.takeIf { it.isNotBlank() }?.let { "Max INR $it" }).ifEmpty { listOf("None") }.joinToString()}", style = MaterialTheme.typography.bodySmall)
+                        if (reportType == "Books by Library" || reportType == "Library-wise Book Count") {
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search libraries") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            libraryBookCounts.forEach { (library, count) -> ReportInsight(library.name, "$count ${if (count == 1) "book" else "books"} | Created ${library.createdAtMillis}") }
+                        }
+                        else if (reportType == "Books by Author") {
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search authors") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (authorBookCounts.isEmpty()) Text("No authors match the selected filters.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else authorBookCounts.forEach { (author, count, investment) -> ReportInsight(author, "$count ${if (count == 1) "book" else "books"} | ${formatInr(investment)}") }
+                        }
+                        else if (reportType == "Books by Category" || reportType == "Books by Language") {
+                            val breakdowns = if (reportType == "Books by Category") categoryBookCounts else languageBookCounts
+                            val label = if (reportType == "Books by Category") "Search categories" else "Search languages"
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text(label) }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (breakdowns.isEmpty()) Text("No matching groups for the selected filters.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else breakdowns.forEach { (name, count, investment) -> ReportInsight(name, "$count ${if (count == 1) "book" else "books"} | ${formatInr(investment)}") }
+                        }
+                        else if (reportType == "Books by Publisher" || reportType == "Books by Rating") {
+                            val breakdowns = if (reportType == "Books by Publisher") publisherBookCounts else ratingBookCounts
+                            val label = if (reportType == "Books by Publisher") "Search publishers" else "Search ratings"
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text(label) }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (breakdowns.isEmpty()) Text("No matching groups for the selected filters.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else breakdowns.forEach { (name, count, investment) -> ReportInsight(name, "$count ${if (count == 1) "book" else "books"} | ${formatInr(investment)}") }
+                        }
+                        else if (reportType == "Books by Reading Status") {
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search reading statuses") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (readingStatusBookCounts.isEmpty()) Text("No reading statuses match the selected filters.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else readingStatusBookCounts.forEach { (status, count, investment) -> ReportInsight(status, "$count ${if (count == 1) "book" else "books"} | ${formatInr(investment)}") }
+                        }
+                        else if (reportType == "Spending by Category") {
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search spending categories") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (spendingByCategory.isEmpty()) Text("No spending matches the selected filters.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else spendingByCategory.forEach { (category, count, investment) -> ReportInsight(category, "${formatInr(investment)} | $count ${if (count == 1) "book" else "books"}") }
+                        }
+                        else if (reportType == "Recently Created Libraries") {
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search recently created libraries") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (recentlyCreatedLibraries.isEmpty()) Text("No libraries were created in the last 30 days.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else recentlyCreatedLibraries.forEach { library ->
+                                ReportInsight(library.name, "Created ${java.time.Instant.ofEpochMilli(library.createdAtMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate().format(DateTimeFormatter.ofPattern("dd MMM uuuu"))}")
+                            }
+                        }
+                        else if (reportType == "Recently Added Books") {
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search recently added books") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (pageBooks.isEmpty()) Text("No books were added in the last 30 days.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else pageBooks.forEach { book ->
+                                val addedDate = java.time.Instant.ofEpochMilli(book.createdAtMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate().format(DateTimeFormatter.ofPattern("dd MMM uuuu"))
+                                ReportInsight(book.title, "${book.author} | Added $addedDate")
+                            }
+                            if (totalPages > 1) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { TextButton(onClick = { resultPage -= 1 }, enabled = resultPage > 0) { Text("Previous") }; Text("Page ${resultPage + 1} of $totalPages"); TextButton(onClick = { resultPage += 1 }, enabled = resultPage < totalPages - 1) { Text("Next") } }
+                        }
+                        else if (reportType == "All Purchases") {
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search purchases") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (pageBooks.isEmpty()) Text("No purchases match the selected filters.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else pageBooks.forEach { book ->
+                                ReportInsight(book.title, "${book.author} | Purchased ${book.purchaseDate} | ${formatInr(book.pricePaise)}")
+                            }
+                            if (totalPages > 1) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { TextButton(onClick = { resultPage -= 1 }, enabled = resultPage > 0) { Text("Previous") }; Text("Page ${resultPage + 1} of $totalPages"); TextButton(onClick = { resultPage += 1 }, enabled = resultPage < totalPages - 1) { Text("Next") } }
+                        }
+                        else if (reportType == "Monthly Purchase Report" || reportType == "Yearly Purchase Report") {
+                            val purchases = if (reportType == "Monthly Purchase Report") monthlyPurchases else yearlyPurchases
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search purchase period") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (purchases.isEmpty()) Text("No purchases match the selected filters.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else purchases.forEach { (period, count, investment) -> ReportInsight(period, "$count ${if (count == 1) "book" else "books"} | ${formatInr(investment)}") }
+                        }
+                        else if (reportType in listOf("Loaned Books", "Returned Books", "Overdue Books", "Loan History")) {
+                            val visibleLoans = reportLoans.filter { loan ->
+                                val book = allBooks.firstOrNull { it.id == loan.bookId }
+                                resultQuery.isBlank() || listOfNotNull(book?.title, book?.author, loan.borrowerName, loan.borrowedDate, loan.expectedReturnDate)
+                                    .any { it.contains(resultQuery, ignoreCase = true) }
+                            }
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search books, borrowers, or dates") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (visibleLoans.isEmpty()) Text("No loans match the selected filters.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else visibleLoans.forEach { loan ->
+                                val bookTitle = allBooks.firstOrNull { it.id == loan.bookId }?.title ?: "Deleted book"
+                                val loanState = when {
+                                    loan.actualReturnDate != null -> "Returned ${loan.actualReturnDate}"
+                                    !loan.expectedReturnDate.isNullOrBlank() && loan.expectedReturnDate < today.toString() -> "Overdue since ${loan.expectedReturnDate}"
+                                    !loan.expectedReturnDate.isNullOrBlank() -> "Due ${loan.expectedReturnDate}"
+                                    else -> "No due date"
+                                }
+                                ReportInsight(bookTitle, "Borrower: ${loan.borrowerName} | Borrowed ${loan.borrowedDate} | $loanState")
+                            }
+                        }
+                        else if (reportType == "Wishlist by Library") {
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search libraries") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            if (wishlistByLibrary.isEmpty()) Text("No libraries match the selected filters.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            else wishlistByLibrary.forEach { (library, count, expectedCost) -> ReportInsight(library.name, "$count ${if (count == 1) "item" else "items"} | Expected ${formatInr(expectedCost)}") }
+                        }
+                        else if (reportType == "Wishlist Books") reportWishlist.forEach { item -> ReportInsight(item.title, "${item.author ?: "Unknown author"} | ${item.status}") }
+                        else if (reportType in listOf("All Users")) users.forEach { user -> ReportInsight(user.displayName ?: user.username, user.role) }
+                        else {
+                            OutlinedTextField(resultQuery, { resultQuery = it; resultPage = 0 }, label = { Text("Search within report") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { TextButton(onClick = { resultsView = "List" }) { Text("List") }; TextButton(onClick = { resultsView = "Table" }) { Text("Table") } }
+                            pageBooks.forEach { book -> ReportInsight(book.title, if (resultsView == "Table") "${book.author} | ${book.category ?: "-"} | ${formatInr(book.pricePaise)} | ${book.readingStatus}" else "${book.author} | ${book.readingStatus}") }
+                            if (totalPages > 1) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { TextButton(onClick = { resultPage -= 1 }, enabled = resultPage > 0) { Text("Previous") }; Text("Page ${resultPage + 1} of $totalPages"); TextButton(onClick = { resultPage += 1 }, enabled = resultPage < totalPages - 1) { Text("Next") } }
+                        }
+                    } }
                 }
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) { TextButton(onClick = onShare) { Text("Share") }; TextButton(onClick = onExportPdf) { Text("PDF") }; Button(onClick = onExportExcel) { Text("Excel") } }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), verticalAlignment = Alignment.CenterVertically) { TextButton(onClick = { onShare(reportBooks, reportLoans) }) { Text("Share") }; TextButton(onClick = { onExportPdf(reportBooks, reportLoans) }) { Text("PDF") }; Button(onClick = { onExportExcel(reportBooks, reportLoans, reportWishlist) }) { Text("Excel") } }
             }
         }
     }
@@ -1932,9 +2304,62 @@ private fun reportShareText(books: List<BookEntity>, libraries: List<LibraryEnti
 
 private fun createReportPdf(books: List<BookEntity>, libraries: List<LibraryEntity>, loans: List<LoanEntity>): ByteArray = ByteArrayOutputStream().use { output ->
     val document = PdfDocument()
-    val page = document.startPage(PdfDocument.PageInfo.Builder(595, 842, 1).create())
-    val paint = Paint().apply { textSize = 16f }
-    listOf("Library Report", "Generated: ${LocalDate.now()}", "Total books: ${books.size}", "Total libraries: ${libraries.size}", "Favourite books: ${books.count { it.favourite }}", "Active loans: ${loans.count { it.actualReturnDate == null }}", "Total investment: ${formatInr(books.sumOf { it.pricePaise })}").forEachIndexed { index, line -> page.canvas.drawText(line, 48f, 64f + index * 32f, paint) }
+    val reportLines = buildList {
+        add("Library Report")
+        add("Generated: ${LocalDate.now().format(DateTimeFormatter.ofPattern("dd MMM uuuu"))}")
+        add("")
+        add("Summary")
+        add("Total books: ${books.size}")
+        add("Libraries represented: ${books.map { it.libraryId }.distinct().size} of ${libraries.size}")
+        add("Favourite books: ${books.count { it.favourite }}")
+        add("Active loans: ${loans.count { it.actualReturnDate == null }}")
+        add("Overdue loans: ${loans.count { it.actualReturnDate == null && !it.expectedReturnDate.isNullOrBlank() && it.expectedReturnDate < LocalDate.now().toString() }}")
+        add("Total investment: ${formatInr(books.sumOf { it.pricePaise })}")
+        add("Average price: ${formatInr(if (books.isEmpty()) 0 else books.sumOf { it.pricePaise } / books.size)}")
+        add("")
+        add("Books")
+        if (books.isEmpty()) add("No books match the selected report filters.")
+        else {
+            add("Title | Author | Category | Price | Status | Rating")
+            books.sortedBy { it.title.lowercase() }.forEach { book ->
+                add("${book.title} | ${book.author} | ${book.category ?: "Uncategorized"} | ${formatInr(book.pricePaise)} | ${book.readingStatus} | ${book.rating?.toString() ?: "-"}")
+            }
+        }
+        add("")
+        add("Loans")
+        if (loans.isEmpty()) add("No loans match the selected report filters.")
+        else {
+            add("Book | Borrower | Borrowed | Due | Status")
+            loans.forEach { loan ->
+                val bookTitle = books.firstOrNull { it.id == loan.bookId }?.title ?: "Deleted book"
+                val status = when {
+                    loan.actualReturnDate != null -> "Returned"
+                    !loan.expectedReturnDate.isNullOrBlank() && loan.expectedReturnDate < LocalDate.now().toString() -> "Overdue"
+                    else -> "Active"
+                }
+                add("$bookTitle | ${loan.borrowerName} | ${loan.borrowedDate} | ${loan.expectedReturnDate ?: "-"} | $status")
+            }
+        }
+    }
+    val titlePaint = Paint().apply { textSize = 18f; isFakeBoldText = true }
+    val bodyPaint = Paint().apply { textSize = 9f }
+    val headingPaint = Paint().apply { textSize = 12f; isFakeBoldText = true }
+    var pageNumber = 1
+    var page = document.startPage(PdfDocument.PageInfo.Builder(595, 842, pageNumber).create())
+    var y = 52f
+    reportLines.forEach { line ->
+        if (y > 790f) {
+            page.canvas.drawText("Page $pageNumber", 500f, 816f, bodyPaint)
+            document.finishPage(page)
+            pageNumber += 1
+            page = document.startPage(PdfDocument.PageInfo.Builder(595, 842, pageNumber).create())
+            y = 52f
+        }
+        val paint = when (line) { "Library Report" -> titlePaint; "Summary", "Books", "Loans" -> headingPaint; else -> bodyPaint }
+        page.canvas.drawText(line.take(112), 42f, y, paint)
+        y += if (paint == titlePaint) 30f else 16f
+    }
+    page.canvas.drawText("Page $pageNumber", 500f, 816f, bodyPaint)
     document.finishPage(page)
     document.writeTo(output)
     document.close()

@@ -1,6 +1,6 @@
 # Personal AI Library Manager
 
-A local Streamlit application for maintaining a personal book catalogue.
+A local Streamlit application for maintaining a personal book catalogue, with an offline-first native Android companion in [android/](android/).
 
 ## Implemented features
 
@@ -49,3 +49,7 @@ Copy the complete project folder, including `data/library.db` and `uploads/book_
 ```bash
 pytest
 ```
+
+## Android application
+
+The native Android app supports the same local-library workflow, including interactive Books summary tabs and structured Search filters. Build, install, and Android-specific usage details are in [android/README.md](android/README.md).
